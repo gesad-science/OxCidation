@@ -142,6 +142,9 @@ venv.bak/
 # mkdocs documentation
 /site
 
+extra-progress/
+*/session.txt
+session.txt
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -179,3 +182,5 @@ pyrightconfig.json
 *.pdf
 *.csv
 *.txt
+
+logs/

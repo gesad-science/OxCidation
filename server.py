@@ -9,6 +9,9 @@ import re
 from pydantic import BaseModel, Field
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
+from config import ConfigDetails
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("RustToolkitRunnerServer")
 
+configs = ConfigDetails()
 
 class TranslationResult(BaseModel):
     reasoning: str = Field(
@@ -43,20 +47,30 @@ def clean_markdown_code(raw_code: str) -> str:
 
 
 def get_llm():
-    provider = os.getenv("LLM_PROVIDER", "openrouter")
+    provider = configs.llm_provider.lower()
 
-    if provider == "openrouter":
+    if provider == "ollama":
+        return ChatOllama(
+            model=configs.llm_model,
+            base_url=configs.ollama_base_url,
+            temperature=0,
+        )
+
+    elif provider == "openrouter":
         return ChatOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY", "dummy"),
-            model=os.getenv("LLM_MODEL", "openai/gpt-oss-120b:free"),
-        )
-    else:
-        return ChatOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY", "dummy"),
-            model=os.getenv("LLM_MODEL", "gpt-4o"),
+            model=configs.llm_model
         )
 
+    elif provider == "openai":
+        return ChatOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY", "dummy"),
+            model=configs.llm_model
+        )
+
+    else:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
 
 @mcp.tool()
 def compile_rust_code(source_code: str) -> str:
@@ -99,6 +113,9 @@ def translate_c_to_rust(c_code: str) -> str:
         rust_code = clean_markdown_code(response.rust_code)
         prompt_tokens = 0
         completion_tokens = 0
+
+        logger.info(f"LLM response type: {type(response)}")
+        logger.info(f"LLM response: {response}")
 
     except Exception as strict_err:
         logger.warning(
@@ -161,14 +178,23 @@ def repair_rust_code(rust_code: str, errors: str) -> str:
     """
     Repairs Rust code based on compiler errors using an LLM.
     """
-    # TODO: Initialize OpenAI client and prompt here
-    # from langchain_openai import ChatOpenAI
-    # llm = ChatOpenAI(model="gpt-4")
-    # prompt = f"Fix this Rust code:\n{rust_code}\n\nCompiler Errors:\n{errors}"
-    # return llm.invoke(prompt).content
-
-    # Mock response for now
-    return 'fn main() {\n    let x = 5;\n    println!("Fixed! x is {}", x);\n}'
+    llm = get_llm()
+    
+    repair_prompt = (
+        f"You are an expert Rust developer. Fix this Rust code to resolve the compiler errors:\n\n"
+        f"Code:\n{rust_code}\n\n"
+        f"Compiler Errors:\n{errors}\n\n"
+        f"Return ONLY the fixed Rust code, no explanations or markdown wrappers."
+    )
+    
+    try:
+        response = llm.invoke(repair_prompt)
+        repaired_code = clean_markdown_code(response.content)
+        logger.info(f"Repair completed successfully")
+        return repaired_code
+    except Exception as e:
+        logger.error(f"Repair failed: {str(e)}")
+        return ""
 
 
 if __name__ == "__main__":

@@ -1,3 +1,1 @@
-fn main() {
-    println!("Hello from dummy C file");
-}
+fn main() -> ! { println!("Hello from dummy Rust file"); }

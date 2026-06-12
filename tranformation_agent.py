@@ -28,10 +28,28 @@ class TranslatorState(TypedDict):
     rust_code: str
     errors: str
     status: Literal["success", "failed", "in_progress"]
+    repair_count: int
     execution_history: List[StepLog]
 
 
 # Nodes
+
+MAX_REPAIRS = 5
+
+
+def route_after_compile(state: TranslatorState):
+
+    if state["status"] == "success":
+        return END
+
+    if state["repair_count"] >= MAX_REPAIRS:
+        logger.error(
+            f"[{state['file_name']}] Max repair attempts reached."
+        )
+        return END
+
+    return "repair_node"
+
 async def translate_node(
     state: TranslatorState, config: RunnableConfig
 ) -> TranslatorState:
@@ -80,6 +98,33 @@ async def translate_node(
         "execution_history": history,
     }
 
+async def repair_node(
+    state: TranslatorState,
+    config: RunnableConfig,
+) -> TranslatorState:
+
+    logger.info(
+        f"[{state['file_name']}] Repair attempt #{state['repair_count'] + 1}"
+    )
+
+    mcp_session: ClientSession = config["configurable"]["mcp_session"]
+
+    result = await mcp_session.call_tool(
+        "repair_rust_code",
+        arguments={
+            "rust_code": state["rust_code"],
+            "errors": state["errors"],
+        },
+    )
+
+    repaired_code = result.content[0].text
+
+    logger.info(f"[{state['file_name']}] Repair completed, returning to compile step. RESULT:\n{repaired_code}")
+
+    return {
+        "rust_code": repaired_code,
+        "repair_count": state["repair_count"] + 1,
+    }
 
 async def compile_node(
     state: TranslatorState, config: RunnableConfig
@@ -127,29 +172,26 @@ async def compile_node(
     }
 
 
-# Routing logic
-def route_after_compile(state: TranslatorState) -> Literal["__end__"]:
-    """Determines the next step based on compilation success."""
-    status = state["status"]
-
-    if status == "success":
-        logger.info(f"[{state['file_name']}] Compilation successful. Ending workflow.")
-    else:
-        logger.info(
-            f"[{state['file_name']}] Compilation failed. Ending workflow without repair phase."
-        )
-
-    return END
-
-
 # Graph
 workflow = StateGraph(TranslatorState)
+
 workflow.add_node("translate_node", translate_node)
 workflow.add_node("compile_node", compile_node)
+workflow.add_node("repair_node", repair_node)
 
 workflow.set_entry_point("translate_node")
+
 workflow.add_edge("translate_node", "compile_node")
-workflow.add_edge("compile_node", END)
+
+workflow.add_conditional_edges(
+    "compile_node",
+    route_after_compile,
+)
+
+workflow.add_edge(
+    "repair_node",
+    "compile_node",
+)
 app = workflow.compile()
 
 
@@ -165,6 +207,7 @@ async def process_file(file_path: str, mcp_session: ClientSession):
         "file_name": file_name,
         "c_code": c_code,
         "status": "in_progress",
+        "repair_count": 0,
         "execution_history": [],
     }
 

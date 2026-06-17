@@ -9,7 +9,7 @@ from langchain_core.runnables import RunnableConfig
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from logger_setup import setup_environment_and_logger
+from logger_setup import setup_environment_and_logger, log_compact_compile, log_compact_test
 
 logger = setup_environment_and_logger(__name__)
 
@@ -27,9 +27,10 @@ class TranslatorState(TypedDict):
     c_code: str
     rust_code: str
     errors: str
-    status: Literal["success", "failed", "in_progress"]
+    status: Literal["success", "failed", "in_progress", "c_failed_compilation", "skipped"]
     repair_count: int
     execution_history: List[StepLog]
+    test_metrics: dict
 
 
 # Nodes
@@ -40,7 +41,7 @@ MAX_REPAIRS = 5
 def route_after_compile(state: TranslatorState):
 
     if state["status"] == "success":
-        return END
+        return "test_node"
 
     if state["repair_count"] >= MAX_REPAIRS:
         logger.error(
@@ -48,6 +49,18 @@ def route_after_compile(state: TranslatorState):
         )
         return END
 
+    return "repair_node"
+
+def route_after_test(state: TranslatorState):
+    if state["status"] in ["success", "skipped", "c_failed_compilation"]:
+        return END
+        
+    if state["repair_count"] >= MAX_REPAIRS:
+        logger.error(
+            f"[{state['file_name']}] Max repair attempts reached after testing."
+        )
+        return END
+        
     return "repair_node"
 
 async def translate_node(
@@ -147,9 +160,11 @@ async def compile_node(
         if "Success:" in compiler_output:
             status = "success"
             errors = ""
+            log_compact_compile(state['file_name'], state['repair_count'], compiler_output, True)
         else:
             status = "failed"
             errors = compiler_output
+            log_compact_compile(state['file_name'], state['repair_count'], compiler_output, False)
 
     except Exception as e:
         status = "failed"
@@ -172,12 +187,79 @@ async def compile_node(
     }
 
 
+async def test_node(
+    state: TranslatorState, config: RunnableConfig
+) -> TranslatorState:
+    logger.info(f"[{state['file_name']}] Evaluating tests...")
+    start_time = time.time()
+    
+    mcp_session: ClientSession = config["configurable"].get("mcp_session")
+    if not mcp_session:
+        return {"status": "failed", "errors": "MCP Client Session not found"}
+        
+    try:
+        result = await mcp_session.call_tool(
+            "evaluate_test_cases",
+            arguments={
+                "file_name": state["file_name"],
+                "c_code": state["c_code"],
+                "rust_code": state["rust_code"]
+            },
+        )
+        test_output = json.loads(result.content[0].text)
+        
+        status = test_output.get("status", "failed")
+        
+        import logging
+        test_logger = logging.getLogger("tests")
+        if status not in ["c_failed_compilation", "failed_compilation", "skipped"]:
+            test_logger.info(
+                f"[{state['file_name']}] Tests: Total={test_output.get('total_tests', 0)}, "
+                f"C(Pass={test_output.get('c_passed', 0)} Fail={test_output.get('c_failed', 0)}), "
+                f"Rust(Pass={test_output.get('rust_passed', 0)} Fail={test_output.get('rust_failed', 0)}), "
+                f"Rust Failed where C Passed={test_output.get('failed_rust_where_c_passed', 0)}, "
+                f"Rust Passed where C Failed={test_output.get('passed_rust_where_c_failed', 0)}"
+            )
+
+        if status in ["success", "skipped", "c_failed_compilation"]:
+            errors = ""
+        else:
+            errors = test_output.get("details", "Tests failed.")
+            logger.error(f"[{state['file_name']}] Tests failed: {errors}")
+            
+        log_compact_test(state['file_name'], status, errors)
+            
+    except Exception as e:
+        test_output = {}
+        status = "failed"
+        errors = f"Test evaluation tool execution failed: {str(e)}"
+        logger.error(f"[{state['file_name']}] {errors}")
+
+    duration = time.time() - start_time
+    history = state.get("execution_history", []) + [
+        {
+            "step_name": "test",
+            "duration_sec": duration,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+    ]
+
+    return {
+        "status": status,
+        "errors": errors,
+        "execution_history": history,
+        "test_metrics": test_output
+    }
+
+
 # Graph
 workflow = StateGraph(TranslatorState)
 
 workflow.add_node("translate_node", translate_node)
 workflow.add_node("compile_node", compile_node)
 workflow.add_node("repair_node", repair_node)
+workflow.add_node("test_node", test_node)
 
 workflow.set_entry_point("translate_node")
 
@@ -186,6 +268,11 @@ workflow.add_edge("translate_node", "compile_node")
 workflow.add_conditional_edges(
     "compile_node",
     route_after_compile,
+)
+
+workflow.add_conditional_edges(
+    "test_node",
+    route_after_test,
 )
 
 workflow.add_edge(
@@ -209,6 +296,7 @@ async def process_file(file_path: str, mcp_session: ClientSession):
         "status": "in_progress",
         "repair_count": 0,
         "execution_history": [],
+        "test_metrics": {}
     }
 
     config = {"configurable": {"mcp_session": mcp_session}}
@@ -245,6 +333,8 @@ async def process_file(file_path: str, mcp_session: ClientSession):
     logger.info(
         f"[{file_name}] Tokens Used: {total_prompt_tokens} prompt / {total_comp_tokens} completion."
     )
+    
+    return result
 
 
 async def main():
@@ -259,6 +349,19 @@ async def main():
         )
         return
 
+    global_metrics = {
+        "total_files": 0,
+        "c_compilation_failed": 0,
+        "rust_compilation_failed": 0,
+        "tests_skipped": 0,
+        "total_c_passed": 0,
+        "total_c_failed": 0,
+        "total_rust_passed": 0,
+        "total_rust_failed": 0,
+        "total_failed_rust_where_c_passed": 0,
+        "total_passed_rust_where_c_failed": 0
+    }
+
     # Starts MCP client
     server_params = StdioServerParameters(
         command="python",
@@ -272,7 +375,30 @@ async def main():
             logger.info("MCP Server connected successfully.")
 
             for file_path in c_files:
-                await process_file(file_path, session)
+                res = await process_file(file_path, session)
+                
+                global_metrics["total_files"] += 1
+                tm = res.get("test_metrics", {})
+                status = res.get("status")
+                
+                if status == "c_failed_compilation":
+                    global_metrics["c_compilation_failed"] += 1
+                elif status == "skipped":
+                    global_metrics["tests_skipped"] += 1
+                elif not tm and status == "failed":
+                    global_metrics["rust_compilation_failed"] += 1
+                else:
+                    global_metrics["total_c_passed"] += tm.get("c_passed", 0)
+                    global_metrics["total_c_failed"] += tm.get("c_failed", 0)
+                    global_metrics["total_rust_passed"] += tm.get("rust_passed", 0)
+                    global_metrics["total_rust_failed"] += tm.get("rust_failed", 0)
+                    global_metrics["total_failed_rust_where_c_passed"] += tm.get("failed_rust_where_c_passed", 0)
+                    global_metrics["total_passed_rust_where_c_failed"] += tm.get("passed_rust_where_c_failed", 0)
+
+            import logging
+            test_logger = logging.getLogger("tests")
+            test_logger.info("=== BATCH RUN SUMMARY ===")
+            test_logger.info(json.dumps(global_metrics, indent=2))
 
 
 if __name__ == "__main__":

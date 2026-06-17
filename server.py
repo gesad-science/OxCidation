@@ -50,11 +50,17 @@ def get_llm():
     provider = configs.llm_provider.lower()
 
     if provider == "ollama":
-        return ChatOllama(
-            model=configs.llm_model,
-            base_url=configs.ollama_base_url,
-            temperature=0,
-        )
+        kwargs = {
+            "model": configs.llm_model,
+            "base_url": configs.ollama_base_url,
+            "temperature": 0,
+        }
+        
+        # Disable native thinking process via Ollama API options if requested
+        if configs.think is False:
+            kwargs["think"] = False
+            
+        return ChatOllama(**kwargs)
 
     elif provider == "openrouter":
         return ChatOpenAI(
@@ -101,7 +107,9 @@ def translate_c_to_rust(c_code: str) -> str:
     Returns a JSON string containing the rust_code and token usage.
     """
     llm = get_llm()
-    base_prompt = f"Translate the following C code to Rust:\n\n{c_code}"
+    with open("direct_translation_prompt.txt", "r", encoding="utf-8") as f:
+        prompt_template = f.read()
+    base_prompt = prompt_template.format(c_code=c_code)
 
     try:
         # Enforce strict JSON Schema mode instead of function calling
@@ -176,14 +184,14 @@ def translate_c_to_rust(c_code: str) -> str:
 @mcp.tool()
 def repair_rust_code(rust_code: str, errors: str) -> str:
     """
-    Repairs Rust code based on compiler errors using an LLM.
+    Repairs Rust code based on compiler errors or test failures using an LLM.
     """
     llm = get_llm()
     
     repair_prompt = (
-        f"You are an expert Rust developer. Fix this Rust code to resolve the compiler errors:\n\n"
+        f"You are an expert Rust developer. Fix this Rust code to resolve the issues (compiler errors or test failures):\n\n"
         f"Code:\n{rust_code}\n\n"
-        f"Compiler Errors:\n{errors}\n\n"
+        f"Issues:\n{errors}\n\n"
         f"Return ONLY the fixed Rust code, no explanations or markdown wrappers."
     )
     
@@ -195,6 +203,126 @@ def repair_rust_code(rust_code: str, errors: str) -> str:
     except Exception as e:
         logger.error(f"Repair failed: {str(e)}")
         return ""
+
+
+@mcp.tool()
+def evaluate_test_cases(file_name: str, c_code: str, rust_code: str) -> str:
+    """
+    Compiles and evaluates both C and Rust code against I/O test cases.
+    """
+    base_name = file_name.replace(".c", "")
+    test_dir = os.path.join("tests", base_name)
+    
+    if not os.path.exists(test_dir):
+        return json.dumps({
+            "status": "skipped",
+            "reason": f"No tests found for {file_name} in {test_dir}"
+        })
+        
+    in_files = sorted([f for f in os.listdir(test_dir) if f.endswith(".in")])
+    if not in_files:
+        return json.dumps({
+            "status": "skipped",
+            "reason": f"No .in files found in {test_dir}"
+        })
+        
+    result = {
+        "status": "success",
+        "c_compilation": "success",
+        "rust_compilation": "success",
+        "total_tests": len(in_files),
+        "c_passed": 0,
+        "c_failed": 0,
+        "rust_passed": 0,
+        "rust_failed": 0,
+        "failed_rust_where_c_passed": 0,
+        "passed_rust_where_c_failed": 0,
+        "failed_tests": [],
+        "details": ""
+    }
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        c_file_path = os.path.join(temp_dir, "prog.c")
+        c_bin_path = os.path.join(temp_dir, "prog_c")
+        rust_file_path = os.path.join(temp_dir, "prog.rs")
+        rust_bin_path = os.path.join(temp_dir, "prog_rust")
+        
+        with open(c_file_path, "w") as f:
+            f.write(c_code)
+        with open(rust_file_path, "w") as f:
+            f.write(rust_code)
+            
+        # Compile C
+        c_compile = subprocess.run(["gcc", c_file_path, "-o", c_bin_path], capture_output=True, text=True)
+        if c_compile.returncode != 0:
+            result["c_compilation"] = "failed"
+            result["status"] = "c_failed_compilation"
+            result["details"] = c_compile.stderr
+            return json.dumps(result)
+            
+        # Compile Rust
+        rust_compile = subprocess.run(["rustc", rust_file_path, "-o", rust_bin_path], capture_output=True, text=True)
+        if rust_compile.returncode != 0:
+            result["rust_compilation"] = "failed"
+            result["status"] = "failed"
+            result["details"] = rust_compile.stderr
+            return json.dumps(result)
+            
+        # Run tests
+        for in_file in in_files:
+            out_file = in_file.replace(".in", ".out")
+            in_path = os.path.join(test_dir, in_file)
+            out_path = os.path.join(test_dir, out_file)
+            
+            with open(in_path, "r") as f:
+                input_data = f.read()
+                
+            expected_output = ""
+            if os.path.exists(out_path):
+                with open(out_path, "r") as f:
+                    expected_output = f.read()
+                    
+            # Run C
+            try:
+                c_run = subprocess.run([c_bin_path], input=input_data, capture_output=True, text=True, timeout=5)
+                c_out = c_run.stdout
+            except subprocess.TimeoutExpired:
+                c_out = "TIMEOUT"
+                
+            # Run Rust
+            try:
+                rust_run = subprocess.run([rust_bin_path], input=input_data, capture_output=True, text=True, timeout=5)
+                rust_out = rust_run.stdout
+            except subprocess.TimeoutExpired:
+                rust_out = "TIMEOUT"
+                
+            c_passed = (c_out.split() == expected_output.split())
+            rust_passed = (rust_out.split() == expected_output.split())
+            
+            if c_passed:
+                result["c_passed"] += 1
+            else:
+                result["c_failed"] += 1
+                
+            if rust_passed:
+                result["rust_passed"] += 1
+            else:
+                result["rust_failed"] += 1
+            
+            if c_passed and not rust_passed:
+                result["status"] = "failed"
+                result["failed_tests"].append(in_file)
+                result["failed_rust_where_c_passed"] += 1
+                expected_lines = "\n".join(expected_output.splitlines()[:10])
+                rust_lines = "\n".join(rust_out.splitlines()[:10])
+                result["details"] += f"Test {in_file} failed.\nExpected (first 10 lines):\n{expected_lines}\n\nRust Output (first 10 lines):\n{rust_lines}\n\n"
+            elif rust_passed and not c_passed:
+                result["passed_rust_where_c_failed"] += 1
+            elif not c_passed:
+                # If C failed, we ignore the test failure on the rust side (behavioral fidelity)
+                pass
+                
+    return json.dumps(result)
 
 
 if __name__ == "__main__":

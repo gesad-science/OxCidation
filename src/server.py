@@ -253,7 +253,7 @@ def evaluate_test_cases(file_name: str, c_code: str, rust_code: str) -> str:
             f.write(rust_code)
             
         # Compile C
-        c_compile = subprocess.run(["gcc", c_file_path, "-o", c_bin_path], capture_output=True, text=True)
+        c_compile = subprocess.run(["gcc", c_file_path, "-o", c_bin_path, "-lm"], capture_output=True, text=True)
         if c_compile.returncode != 0:
             result["c_compilation"] = "failed"
             result["status"] = "c_failed_compilation"

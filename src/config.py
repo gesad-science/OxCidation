@@ -1,7 +1,7 @@
 import yaml
 
 class ConfigDetails:
-    def __init__(self, config_file: str = 'config.yaml'):
+    def __init__(self, config_file: str = 'config/config.yaml'):
         self.config_file = config_file
 
         with open(self.config_file, 'r', encoding='utf-8') as f:

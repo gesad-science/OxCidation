@@ -107,7 +107,7 @@ def translate_c_to_rust(c_code: str) -> str:
     Returns a JSON string containing the rust_code and token usage.
     """
     llm = get_llm()
-    with open("direct_translation_prompt.txt", "r", encoding="utf-8") as f:
+    with open("prompts/direct_translation_prompt.txt", "r", encoding="utf-8") as f:
         prompt_template = f.read()
     base_prompt = prompt_template.format(c_code=c_code)
 
@@ -211,7 +211,7 @@ def evaluate_test_cases(file_name: str, c_code: str, rust_code: str) -> str:
     Compiles and evaluates both C and Rust code against I/O test cases.
     """
     base_name = file_name.replace(".c", "")
-    test_dir = os.path.join("tests", base_name)
+    test_dir = os.path.join("data/processed/tests", base_name)
     
     if not os.path.exists(test_dir):
         return json.dumps({

@@ -306,7 +306,7 @@ async def process_file(file_path: str, mcp_session: ClientSession):
 
     # Save the generated Rust code for inspection
     out_name = file_name.replace(".c", ".rs")
-    out_path = os.path.join("output_rust_files", out_name)
+    out_path = os.path.join("data/processed/output_rust_files", out_name)
     if result["rust_code"]:
         with open(out_path, "w") as f:
             f.write(result["rust_code"])
@@ -338,7 +338,7 @@ async def process_file(file_path: str, mcp_session: ClientSession):
 
 
 async def main():
-    input_dir = "input_c_files"
+    input_dir = "data/processed/input_c_files"
     c_files = [
         os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith(".c")
     ]
@@ -365,7 +365,7 @@ async def main():
     # Starts MCP client
     server_params = StdioServerParameters(
         command="python",
-        args=["server.py"],
+        args=["src/server.py"],
     )
 
     logger.info("Initializing MCP Server connection...")

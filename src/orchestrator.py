@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import time
 import asyncio
 import json
@@ -339,6 +340,10 @@ async def process_file(file_path: str, mcp_session: ClientSession):
 
 
 async def main():
+    parser = argparse.ArgumentParser(description="Run the C to Rust translation pipeline.")
+    parser.add_argument("--reset-progress", action="store_true", help="Reset the progress log and start over.")
+    args = parser.parse_args()
+
     input_dir = "data/processed/input_c_files"
     c_files = [
         os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith(".c")
@@ -349,6 +354,11 @@ async def main():
             f"No .c files found in {input_dir}. Please add some to start testing."
         )
         return
+
+    progress_file = "logs/progress.json"
+    if args.reset_progress and os.path.exists(progress_file):
+        os.remove(progress_file)
+        logger.info("Progress log reset.")
 
     global_metrics = {
         "total_files": 0,
@@ -362,6 +372,17 @@ async def main():
         "total_failed_rust_where_c_passed": 0,
         "total_passed_rust_where_c_failed": 0
     }
+    processed_files = set()
+
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file, "r") as f:
+                data = json.load(f)
+                global_metrics = data.get("metrics", global_metrics)
+                processed_files = set(data.get("processed_files", []))
+            logger.info(f"Loaded progress from {progress_file}. {len(processed_files)} files already processed.")
+        except Exception as e:
+            logger.error(f"Failed to load progress file: {e}")
 
     # Starts MCP client
     server_params = StdioServerParameters(
@@ -376,6 +397,11 @@ async def main():
             logger.info("MCP Server connected successfully.")
 
             for file_path in c_files:
+                file_name = os.path.basename(file_path)
+                if file_name in processed_files:
+                    logger.info(f"Skipping {file_name}, already processed.")
+                    continue
+
                 res = await process_file(file_path, session)
                 
                 global_metrics["total_files"] += 1
@@ -395,6 +421,13 @@ async def main():
                     global_metrics["total_rust_failed"] += tm.get("rust_failed", 0)
                     global_metrics["total_failed_rust_where_c_passed"] += tm.get("failed_rust_where_c_passed", 0)
                     global_metrics["total_passed_rust_where_c_failed"] += tm.get("passed_rust_where_c_failed", 0)
+
+                processed_files.add(file_name)
+                with open(progress_file, "w") as f:
+                    json.dump({
+                        "metrics": global_metrics,
+                        "processed_files": list(processed_files)
+                    }, f, indent=2)
 
             import logging
             test_logger = logging.getLogger("tests")

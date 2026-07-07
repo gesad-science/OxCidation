@@ -1,6 +1,0 @@
-# LLM provider configuration: openrouter, openai, or ollama
-provider: ollama
-# Model name for the selected provider
-model: llama3.2:3b
-# Optional Ollama server URL (defaults to OLLAMA_HOST env or http://localhost:11434)
-base_url: http://localhost:11434

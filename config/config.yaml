@@ -1,0 +1,8 @@
+# LLM provider configuration: openrouter, openai, or ollama
+provider: ollama
+# Model name for the selected provider
+model: gemma4:latest
+# Optional Ollama server URL (defaults to OLLAMA_HOST env or http://localhost:11434)
+base_url: http://localhost:11434
+# Whether the model is allowed to think natively (can be set to false for Ollama APIs)
+think: false

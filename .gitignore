@@ -187,5 +187,7 @@ logs/
 Ata de Reunião 09-06 e Planejamento Técnico - Agente de Tradução C para Rust.md
 docs-local/
 docs-local/*
-.codex/
-.claude/
+.codex
+.claude
+test_env.py
+data/processed/output_rust_files/*.rs

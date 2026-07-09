@@ -12,3 +12,9 @@ class ConfigDetails:
         self.max_repair_attempts = self.config_data.get("max_repair_attempts", 3)
         self.ollama_base_url = self.config_data.get("base_url", "http://localhost:11434")
         self.think = self.config_data.get("think", True)
+        self.judge_backend = self.config_data.get("judge_backend", "auto")
+        self.judge_time_limit_sec = self.config_data.get("judge_time_limit_sec", 5)
+        self.judge_compare_mode = self.config_data.get(
+            "judge_compare_mode",
+            "ignore-spaces-and-newlines",
+        )

@@ -1,11 +1,14 @@
 import os
 import logging
+import json
+from datetime import datetime
 
 def setup_environment_and_logger(name: str) -> logging.Logger:
-    """Creates required directories and configures the logger."""
     os.makedirs("logs", exist_ok=True)
+    os.makedirs("logs/runs", exist_ok=True)
     os.makedirs("data/processed/input_c_files", exist_ok=True)
     os.makedirs("data/processed/output_rust_files", exist_ok=True)
+    os.makedirs("data/processed/judge_tests", exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -35,7 +38,6 @@ def setup_environment_and_logger(name: str) -> logging.Logger:
 
 
 def log_compact_compile(file_name: str, repair_count: int, compiler_output: str, success: bool):
-    """Helper to keep parsing logic out of the main agent file."""
     compact_logger = logging.getLogger("compact")
     if success:
         compact_logger.info(f"[{file_name}] Compile attempt #{repair_count+1}: SUCCESS")
@@ -48,7 +50,6 @@ def log_compact_compile(file_name: str, repair_count: int, compiler_output: str,
         compact_logger.info(f"[{file_name}] Compile attempt #{repair_count+1}: FAIL - {compact_err}")
 
 def log_compact_test(file_name: str, status: str, errors: str):
-    """Helper to keep parsing logic out of the main agent file."""
     compact_logger = logging.getLogger("compact")
     if status == "success":
         compact_logger.info(f"[{file_name}] Test evaluation: PASS")
@@ -58,3 +59,37 @@ def log_compact_test(file_name: str, status: str, errors: str):
         compact_logger.info(f"[{file_name}] C Compilation: FAIL")
     else:
         compact_logger.info(f"[{file_name}] Test evaluation: FAIL\n{errors}")
+
+
+def log_compact_judge(
+    file_name: str,
+    status: str,
+    details: str,
+    verdict_counts: dict | None = None,
+):
+    compact_logger = logging.getLogger("compact")
+    counts = ""
+    if verdict_counts:
+        non_zero_counts = [
+            f"{verdict}={count}"
+            for verdict, count in verdict_counts.items()
+            if count
+        ]
+        counts = f" ({', '.join(non_zero_counts)})" if non_zero_counts else ""
+
+    if status == "ACCEPTED":
+        compact_logger.info(f"[{file_name}] Judge evaluation: ACCEPTED{counts}")
+    elif status == "SKIPPED":
+        compact_logger.info(f"[{file_name}] Judge evaluation: SKIPPED")
+    else:
+        compact_logger.info(f"[{file_name}] Judge evaluation: {status}{counts}\n{details}")
+
+
+class RunRecorder:
+    def __init__(self):
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.path = os.path.join("logs", "runs", f"{timestamp}.jsonl")
+
+    def write(self, record: dict):
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")

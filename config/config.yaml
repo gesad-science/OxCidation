@@ -6,3 +6,9 @@ model: gemma4:latest
 base_url: http://localhost:11434
 # Whether the model is allowed to think natively (can be set to false for Ollama APIs)
 think: false
+# Repair limit shared by compile, visible-test, and judge feedback loops
+max_repair_attempts: 5
+# Judge backend: auto prefers online-judge-tools when available, python is the local fallback
+judge_backend: auto
+judge_time_limit_sec: 5
+judge_compare_mode: ignore-spaces-and-newlines

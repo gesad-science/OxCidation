@@ -185,3 +185,7 @@ pyrightconfig.json
 
 logs/
 Ata de Reunião 09-06 e Planejamento Técnico - Agente de Tradução C para Rust.md
+docs-local/
+docs-local/*
+.codex/
+.claude/

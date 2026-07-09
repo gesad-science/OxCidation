@@ -1,291 +1,177 @@
-import os
-import sys
 import argparse
-import time
 import asyncio
 import json
-from typing import TypedDict, Literal, List
-from langgraph.graph import StateGraph, END
-from langchain_core.runnables import RunnableConfig
+import logging
+import os
+import sys
 
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, StateGraph
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from logger_setup import setup_environment_and_logger, log_compact_compile, log_compact_test
+from agents import (
+    AgentState,
+    CodeEvaluator,
+    CodeTranslatorAgent,
+    CodeValidator,
+    TesterAgent,
+)
+from config import ConfigDetails
+from contracts import ValidationDecision
+from logger_setup import RunRecorder, setup_environment_and_logger
 
 logger = setup_environment_and_logger(__name__)
+test_logger = logging.getLogger("tests")
+configs = ConfigDetails()
+
+COMPILE_ROUTES = {
+    "run_visible_tests": "test_node",
+    "repair_translation": "repair_node",
+    "stop_failed": END,
+}
+VISIBLE_TEST_ROUTES = {
+    "run_judge": "judge_node",
+    "repair_translation": "repair_node",
+    "stop_failed": END,
+}
+JUDGE_ROUTES = {
+    "stop_success": END,
+    "stop_evaluated": END,
+    "stop_failed": END,
+    "skip": END,
+}
 
 
-# State
-class StepLog(TypedDict):
-    step_name: str
-    duration_sec: float
-    prompt_tokens: int
-    completion_tokens: int
+def _mcp_session(config: RunnableConfig) -> ClientSession:
+    return config["configurable"]["mcp_session"]
 
 
-class TranslatorState(TypedDict):
-    file_name: str
-    c_code: str
-    rust_code: str
-    errors: str
-    status: Literal["success", "failed", "in_progress", "c_failed_compilation", "skipped"]
-    repair_count: int
-    execution_history: List[StepLog]
-    test_metrics: dict
+def _route(decision: ValidationDecision, mapping: dict):
+    return mapping.get(decision["next_action"], END)
 
 
-# Nodes
+def route_after_compile_validation(state: AgentState):
+    return _route(state["validation_decision"], COMPILE_ROUTES)
 
-MAX_REPAIRS = 5
+
+def route_after_visible_validation(state: AgentState):
+    return _route(state["validation_decision"], VISIBLE_TEST_ROUTES)
 
 
-def route_after_compile(state: TranslatorState):
+def route_after_judge_validation(state: AgentState):
+    return _route(state["validation_decision"], JUDGE_ROUTES)
 
-    if state["status"] == "success":
-        return "test_node"
-
-    if state["repair_count"] >= MAX_REPAIRS:
-        logger.error(
-            f"[{state['file_name']}] Max repair attempts reached."
-        )
-        return END
-
-    return "repair_node"
-
-def route_after_test(state: TranslatorState):
-    if state["status"] in ["success", "skipped", "c_failed_compilation"]:
-        return END
-        
-    if state["repair_count"] >= MAX_REPAIRS:
-        logger.error(
-            f"[{state['file_name']}] Max repair attempts reached after testing."
-        )
-        return END
-        
-    return "repair_node"
 
 async def translate_node(
-    state: TranslatorState, config: RunnableConfig
-) -> TranslatorState:
-    """Sends the C code to the MCP translation tool."""
-    logger.info(f"[{state['file_name']}] Translating C to Rust...")
-    start_time = time.time()
-
-    mcp_session: ClientSession = config["configurable"].get("mcp_session")
-    if not mcp_session:
-        return {"status": "failed", "errors": "MCP Client Session not found"}
-
-    try:
-        result = await mcp_session.call_tool(
-            "translate_c_to_rust",
-            arguments={"c_code": state["c_code"]},
-        )
-        parsed_result = json.loads(result.content[0].text)
-        rust_code = parsed_result.get("rust_code", "")
-        prompt_tokens = parsed_result.get("prompt_tokens", 0)
-        completion_tokens = parsed_result.get("completion_tokens", 0)
-
-        status = state.get("status", "in_progress")
-        errors = state.get("errors", "")
-    except Exception as e:
-        logger.error(f"[{state['file_name']}] Translation error: {str(e)}")
-        rust_code = ""
-        prompt_tokens = 0
-        completion_tokens = 0
-        status = "failed"
-        errors = f"Translation tool execution failed: {str(e)}"
-
-    duration = time.time() - start_time
-    history = state.get("execution_history", []) + [
-        {
-            "step_name": "translate",
-            "duration_sec": duration,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-        }
-    ]
-
-    return {
-        "rust_code": rust_code,
-        "status": status,
-        "errors": errors,
-        "execution_history": history,
-    }
-
-async def repair_node(
-    state: TranslatorState,
+    state: AgentState,
     config: RunnableConfig,
-) -> TranslatorState:
+) -> AgentState:
+    return await CodeTranslatorAgent(_mcp_session(config)).translate(state)
 
-    logger.info(
-        f"[{state['file_name']}] Repair attempt #{state['repair_count'] + 1}"
-    )
-
-    mcp_session: ClientSession = config["configurable"]["mcp_session"]
-
-    result = await mcp_session.call_tool(
-        "repair_rust_code",
-        arguments={
-            "rust_code": state["rust_code"],
-            "errors": state["errors"],
-        },
-    )
-
-    repaired_code = result.content[0].text
-
-    logger.info(f"[{state['file_name']}] Repair completed, returning to compile step. RESULT:\n{repaired_code}")
-
-    return {
-        "rust_code": repaired_code,
-        "repair_count": state["repair_count"] + 1,
-    }
 
 async def compile_node(
-    state: TranslatorState, config: RunnableConfig
-) -> TranslatorState:
-    """Sends the generated Rust code to the MCP compiler tool."""
-    logger.info(f"[{state['file_name']}] Compiling Rust code...")
-    start_time = time.time()
+    state: AgentState,
+    config: RunnableConfig,
+) -> AgentState:
+    return await CodeTranslatorAgent(_mcp_session(config)).compile(state)
 
-    mcp_session: ClientSession = config["configurable"].get("mcp_session")
-    if not mcp_session:
-        return {"status": "failed", "errors": "MCP Client Session not found"}
 
-    try:
-        result = await mcp_session.call_tool(
-            "compile_rust_code",
-            arguments={"source_code": state["rust_code"]},
-        )
-        compiler_output = result.content[0].text
+async def validate_compile_node(state: AgentState) -> AgentState:
+    return CodeValidator(configs.max_repair_attempts).from_compile(state)
 
-        if "Success:" in compiler_output:
-            status = "success"
-            errors = ""
-            log_compact_compile(state['file_name'], state['repair_count'], compiler_output, True)
-        else:
-            status = "failed"
-            errors = compiler_output
-            log_compact_compile(state['file_name'], state['repair_count'], compiler_output, False)
 
-    except Exception as e:
-        status = "failed"
-        errors = f"Compilation tool execution failed: {str(e)}"
-
-    duration = time.time() - start_time
-    history = state.get("execution_history", []) + [
-        {
-            "step_name": "compile",
-            "duration_sec": duration,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
-    ]
-
-    return {
-        "errors": errors,
-        "status": status,
-        "execution_history": history,
-    }
+async def repair_node(
+    state: AgentState,
+    config: RunnableConfig,
+) -> AgentState:
+    return await CodeTranslatorAgent(_mcp_session(config)).repair(state)
 
 
 async def test_node(
-    state: TranslatorState, config: RunnableConfig
-) -> TranslatorState:
-    logger.info(f"[{state['file_name']}] Evaluating tests...")
-    start_time = time.time()
-    
-    mcp_session: ClientSession = config["configurable"].get("mcp_session")
-    if not mcp_session:
-        return {"status": "failed", "errors": "MCP Client Session not found"}
-        
-    try:
-        result = await mcp_session.call_tool(
-            "evaluate_test_cases",
-            arguments={
-                "file_name": state["file_name"],
-                "c_code": state["c_code"],
-                "rust_code": state["rust_code"]
-            },
-        )
-        test_output = json.loads(result.content[0].text)
-        
-        status = test_output.get("status", "failed")
-        
-        import logging
-        test_logger = logging.getLogger("tests")
-        if status not in ["c_failed_compilation", "failed_compilation", "skipped"]:
-            test_logger.info(
-                f"[{state['file_name']}] Tests: Total={test_output.get('total_tests', 0)}, "
-                f"C(Pass={test_output.get('c_passed', 0)} Fail={test_output.get('c_failed', 0)}), "
-                f"Rust(Pass={test_output.get('rust_passed', 0)} Fail={test_output.get('rust_failed', 0)}), "
-                f"Rust Failed where C Passed={test_output.get('failed_rust_where_c_passed', 0)}, "
-                f"Rust Passed where C Failed={test_output.get('passed_rust_where_c_failed', 0)}"
-            )
-
-        if status in ["success", "skipped", "c_failed_compilation"]:
-            errors = ""
-        else:
-            errors = test_output.get("details", "Tests failed.")
-            logger.error(f"[{state['file_name']}] Tests failed: {errors}")
-            
-        log_compact_test(state['file_name'], status, errors)
-            
-    except Exception as e:
-        test_output = {}
-        status = "failed"
-        errors = f"Test evaluation tool execution failed: {str(e)}"
-        logger.error(f"[{state['file_name']}] {errors}")
-
-    duration = time.time() - start_time
-    history = state.get("execution_history", []) + [
-        {
-            "step_name": "test",
-            "duration_sec": duration,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
-    ]
-
-    return {
-        "status": status,
-        "errors": errors,
-        "execution_history": history,
-        "test_metrics": test_output
-    }
+    state: AgentState,
+    config: RunnableConfig,
+) -> AgentState:
+    return await TesterAgent(_mcp_session(config)).run_suite(state)
 
 
-# Graph
-workflow = StateGraph(TranslatorState)
+async def validate_visible_node(state: AgentState) -> AgentState:
+    return CodeValidator(configs.max_repair_attempts).from_tests(state)
 
+
+async def judge_node(
+    state: AgentState,
+    config: RunnableConfig,
+) -> AgentState:
+    return await CodeEvaluator(_mcp_session(config)).evaluate(state)
+
+
+async def validate_judge_node(state: AgentState) -> AgentState:
+    return CodeValidator(configs.max_repair_attempts).from_judge(state)
+
+
+workflow = StateGraph(AgentState)
 workflow.add_node("translate_node", translate_node)
 workflow.add_node("compile_node", compile_node)
+workflow.add_node("validate_compile_node", validate_compile_node)
 workflow.add_node("repair_node", repair_node)
 workflow.add_node("test_node", test_node)
+workflow.add_node("validate_visible_node", validate_visible_node)
+workflow.add_node("judge_node", judge_node)
+workflow.add_node("validate_judge_node", validate_judge_node)
 
 workflow.set_entry_point("translate_node")
-
 workflow.add_edge("translate_node", "compile_node")
-
-workflow.add_conditional_edges(
-    "compile_node",
-    route_after_compile,
-)
-
-workflow.add_conditional_edges(
-    "test_node",
-    route_after_test,
-)
-
-workflow.add_edge(
-    "repair_node",
-    "compile_node",
-)
+workflow.add_edge("compile_node", "validate_compile_node")
+workflow.add_conditional_edges("validate_compile_node", route_after_compile_validation)
+workflow.add_edge("repair_node", "compile_node")
+workflow.add_edge("test_node", "validate_visible_node")
+workflow.add_conditional_edges("validate_visible_node", route_after_visible_validation)
+workflow.add_edge("judge_node", "validate_judge_node")
+workflow.add_conditional_edges("validate_judge_node", route_after_judge_validation)
 app = workflow.compile()
 
 
-async def process_file(file_path: str, mcp_session: ClientSession):
-    """Processes a single C file through the workflow."""
+def _run_totals(result: AgentState) -> dict:
+    history = result.get("execution_history", [])
+    return {
+        "duration_sec": round(sum(step["duration_sec"] for step in history), 3),
+        "prompt_tokens": sum(step.get("prompt_tokens", 0) for step in history),
+        "completion_tokens": sum(step.get("completion_tokens", 0) for step in history),
+    }
+
+
+def _log_file_outcome(file_name: str, out_path: str, result: AgentState):
+    status = result.get("status", "failed")
+    judge_status = result.get("judge_result", {}).get("status")
+
+    if status == "success":
+        if judge_status == "ACCEPTED":
+            logger.info(f"[{file_name}] Judge accepted. Saved Rust output to {out_path}")
+        else:
+            logger.info(
+                f"[{file_name}] Visible validation passed. "
+                f"Saved Rust output to {out_path}"
+            )
+        if judge_status and judge_status != "ACCEPTED":
+            logger.info(f"[{file_name}] Judge evaluation status: {judge_status}")
+        return
+
+    if status == "skipped":
+        logger.info(f"[{file_name}] Validation skipped. Saved Rust output to {out_path}")
+        if judge_status:
+            logger.info(f"[{file_name}] Judge evaluation status: {judge_status}")
+        return
+
+    logger.error(f"[{file_name}] Final status: {status}")
+    logger.error(f"[{file_name}] Final reason:\n{result.get('errors', '')}")
+
+
+async def process_file(
+    file_path: str,
+    mcp_session: ClientSession,
+    recorder: RunRecorder,
+) -> AgentState:
     file_name = os.path.basename(file_path)
     logger.info(f"--- Starting processing for {file_name} ---")
 
@@ -295,83 +181,138 @@ async def process_file(file_path: str, mcp_session: ClientSession):
     initial_state = {
         "file_name": file_name,
         "c_code": c_code,
+        "rust_code": "",
         "status": "in_progress",
         "repair_count": 0,
+        "failure_category": "none",
         "execution_history": [],
-        "test_metrics": {}
+        "test_metrics": {},
+        "judge_result": {},
     }
 
-    config = {"configurable": {"mcp_session": mcp_session}}
+    result = await app.ainvoke(
+        initial_state,
+        config={"configurable": {"mcp_session": mcp_session}},
+    )
 
-    # Run graph
-    result = await app.ainvoke(initial_state, config=config)
-
-    # Save the generated Rust code for inspection
     out_name = file_name.replace(".c", ".rs")
     out_path = os.path.join("data/processed/output_rust_files", out_name)
-    if result["rust_code"]:
+    if result.get("rust_code"):
         with open(out_path, "w") as f:
             f.write(result["rust_code"])
 
-    # Log compile result
-    if result["status"] == "success":
-        logger.info(f"[{file_name}] Successfully compiled. Saved to {out_path}")
-    else:
-        logger.error(
-            f"[{file_name}] Failed to compile. Generated code saved to {out_path} for inspection."
-        )
-        logger.error(f"[{file_name}] Final Errors:\n{result['errors']}")
+    totals = _run_totals(result)
+    judge_result = result.get("judge_result", {})
+    record = {
+        "file_name": file_name,
+        "final_status": result.get("status", "failed"),
+        "judge_status": judge_result.get("status"),
+        "judge_passed": judge_result.get("passed", 0),
+        "judge_failed": judge_result.get("failed", 0),
+        "judge_total": judge_result.get("total", 0),
+        "judge_verdict_counts": judge_result.get("verdict_counts", {}),
+        "judge_first_failure": judge_result.get("first_failure", {}),
+        "failure_category": result.get("failure_category", "infrastructure"),
+        "repair_attempts": result.get("repair_count", 0),
+        "visible_tests": result.get("test_metrics", {}),
+        "judge": judge_result,
+        **totals,
+    }
+    recorder.write(record)
 
-    # Logs operation time and token usage
-    total_time = sum(step["duration_sec"] for step in result["execution_history"])
-    total_prompt_tokens = sum(
-        step.get("prompt_tokens", 0) for step in result["execution_history"]
-    )
-    total_comp_tokens = sum(
-        step.get("completion_tokens", 0) for step in result["execution_history"]
-    )
-
-    logger.info(f"[{file_name}] Workflow completed in {total_time:.2f} seconds.")
+    logger.info(f"[{file_name}] Workflow completed in {totals['duration_sec']:.2f} seconds")
     logger.info(
-        f"[{file_name}] Tokens Used: {total_prompt_tokens} prompt / {total_comp_tokens} completion."
+        f"[{file_name}] Tokens Used: {totals['prompt_tokens']} prompt / "
+        f"{totals['completion_tokens']} completion"
     )
-    
+
+    _log_file_outcome(file_name, out_path, result)
+
     return result
+
+
+def _new_global_metrics() -> dict:
+    return {
+        "total_files": 0,
+        "final_success": 0,
+        "final_failed": 0,
+        "final_skipped": 0,
+        "judge_accepted": 0,
+        "judge_failed": 0,
+        "judge_skipped": 0,
+        "rust_compilation_failed": 0,
+        "c_compilation_failed": 0,
+        "visible_tests_skipped": 0,
+        "visible_passed_but_judge_failed": 0,
+        "total_repair_attempts": 0,
+        "failure_categories": {},
+        "judge_verdict_counts": {},
+    }
+
+
+def _update_global_metrics(metrics: dict, result: AgentState):
+    metrics["total_files"] += 1
+    status = result.get("status", "failed")
+    if status == "success":
+        metrics["final_success"] += 1
+    elif status == "skipped":
+        metrics["final_skipped"] += 1
+    else:
+        metrics["final_failed"] += 1
+
+    judge_status = result.get("judge_result", {}).get("status")
+    if judge_status == "ACCEPTED":
+        metrics["judge_accepted"] += 1
+    elif judge_status == "SKIPPED":
+        metrics["judge_skipped"] += 1
+    elif judge_status:
+        metrics["judge_failed"] += 1
+
+    verdict_counts = result.get("judge_result", {}).get("verdict_counts", {})
+    for verdict, count in verdict_counts.items():
+        current_count = metrics["judge_verdict_counts"].get(verdict, 0)
+        metrics["judge_verdict_counts"][verdict] = current_count + count
+
+    test_status = result.get("test_metrics", {}).get("status")
+    if test_status == "skipped":
+        metrics["visible_tests_skipped"] += 1
+    elif test_status == "c_failed_compilation":
+        metrics["c_compilation_failed"] += 1
+
+    category = result.get("failure_category", "infrastructure")
+    if category == "compile" and result.get("status") == "failed":
+        metrics["rust_compilation_failed"] += 1
+
+    if test_status == "success" and judge_status not in [None, "ACCEPTED", "SKIPPED"]:
+        metrics["visible_passed_but_judge_failed"] += 1
+
+    metrics["total_repair_attempts"] += result.get("repair_count", 0)
+    categories = metrics["failure_categories"]
+    categories[category] = categories.get(category, 0) + 1
 
 
 async def main():
     parser = argparse.ArgumentParser(description="Run the C to Rust translation pipeline.")
-    parser.add_argument("--reset-progress", action="store_true", help="Reset the progress log and start over.")
+    parser.add_argument("--reset-progress", action="store_true", help="Reset progress and metrics.")
     args = parser.parse_args()
 
     input_dir = "data/processed/input_c_files"
     c_files = [
-        os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith(".c")
+        os.path.join(input_dir, f)
+        for f in sorted(os.listdir(input_dir))
+        if f.endswith(".c")
     ]
 
     if not c_files:
-        logger.warning(
-            f"No .c files found in {input_dir}. Please add some to start testing."
-        )
+        logger.warning(f"No .c files found in {input_dir}.")
         return
 
     progress_file = "logs/progress.json"
     if args.reset_progress and os.path.exists(progress_file):
         os.remove(progress_file)
-        logger.info("Progress log reset.")
+        logger.info("Progress log reset")
 
-    global_metrics = {
-        "total_files": 0,
-        "c_compilation_failed": 0,
-        "rust_compilation_failed": 0,
-        "tests_skipped": 0,
-        "total_c_passed": 0,
-        "total_c_failed": 0,
-        "total_rust_passed": 0,
-        "total_rust_failed": 0,
-        "total_failed_rust_where_c_passed": 0,
-        "total_passed_rust_where_c_failed": 0
-    }
+    global_metrics = _new_global_metrics()
     processed_files = set()
 
     if os.path.exists(progress_file):
@@ -381,56 +322,42 @@ async def main():
                 global_metrics = data.get("metrics", global_metrics)
                 processed_files = set(data.get("processed_files", []))
             logger.info(f"Loaded progress from {progress_file}. {len(processed_files)} files already processed.")
-        except Exception as e:
-            logger.error(f"Failed to load progress file: {e}")
+        except Exception as exc:
+            logger.error(f"Failed to load progress file: {exc}")
 
-    # Starts MCP client
     server_params = StdioServerParameters(
-        command="python",
+        command=sys.executable,
         args=["src/server.py"],
     )
+    recorder = RunRecorder()
+    logger.info(f"Structured run log: {recorder.path}")
 
-    logger.info("Initializing MCP Server connection...")
+    logger.info("Initializing MCP Server connection")
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            logger.info("MCP Server connected successfully.")
+            logger.info("MCP Server connected successfully")
 
             for file_path in c_files:
                 file_name = os.path.basename(file_path)
                 if file_name in processed_files:
-                    logger.info(f"Skipping {file_name}, already processed.")
+                    logger.info(f"Skipping {file_name}, already processed")
                     continue
 
-                res = await process_file(file_path, session)
-                
-                global_metrics["total_files"] += 1
-                tm = res.get("test_metrics", {})
-                status = res.get("status")
-                
-                if status == "c_failed_compilation":
-                    global_metrics["c_compilation_failed"] += 1
-                elif status == "skipped":
-                    global_metrics["tests_skipped"] += 1
-                elif not tm and status == "failed":
-                    global_metrics["rust_compilation_failed"] += 1
-                else:
-                    global_metrics["total_c_passed"] += tm.get("c_passed", 0)
-                    global_metrics["total_c_failed"] += tm.get("c_failed", 0)
-                    global_metrics["total_rust_passed"] += tm.get("rust_passed", 0)
-                    global_metrics["total_rust_failed"] += tm.get("rust_failed", 0)
-                    global_metrics["total_failed_rust_where_c_passed"] += tm.get("failed_rust_where_c_passed", 0)
-                    global_metrics["total_passed_rust_where_c_failed"] += tm.get("passed_rust_where_c_failed", 0)
-
+                result = await process_file(file_path, session, recorder)
+                _update_global_metrics(global_metrics, result)
                 processed_files.add(file_name)
-                with open(progress_file, "w") as f:
-                    json.dump({
-                        "metrics": global_metrics,
-                        "processed_files": list(processed_files)
-                    }, f, indent=2)
 
-            import logging
-            test_logger = logging.getLogger("tests")
+                with open(progress_file, "w") as f:
+                    json.dump(
+                        {
+                            "metrics": global_metrics,
+                            "processed_files": sorted(processed_files),
+                        },
+                        f,
+                        indent=2,
+                    )
+
             test_logger.info("=== BATCH RUN SUMMARY ===")
             test_logger.info(json.dumps(global_metrics, indent=2))
 

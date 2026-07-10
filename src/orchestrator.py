@@ -30,6 +30,10 @@ COMPILE_ROUTES = {
     "repair_translation": "repair_node",
     "stop_failed": END,
 }
+TRANSLATION_ROUTES = {
+    "compile_translation": "compile_node",
+    "stop_failed": END,
+}
 VISIBLE_TEST_ROUTES = {
     "run_judge": "judge_node",
     "repair_translation": "repair_node",
@@ -55,6 +59,10 @@ def route_after_compile_validation(state: AgentState):
     return _route(state["validation_decision"], COMPILE_ROUTES)
 
 
+def route_after_translation_validation(state: AgentState):
+    return _route(state["validation_decision"], TRANSLATION_ROUTES)
+
+
 def route_after_visible_validation(state: AgentState):
     return _route(state["validation_decision"], VISIBLE_TEST_ROUTES)
 
@@ -75,6 +83,10 @@ async def compile_node(
     config: RunnableConfig,
 ) -> AgentState:
     return await CodeTranslatorAgent(_mcp_session(config)).compile(state)
+
+
+async def validate_translation_node(state: AgentState) -> AgentState:
+    return CodeValidator(configs.max_repair_attempts).from_translation(state)
 
 
 async def validate_compile_node(state: AgentState) -> AgentState:
@@ -112,6 +124,7 @@ async def validate_judge_node(state: AgentState) -> AgentState:
 
 workflow = StateGraph(AgentState)
 workflow.add_node("translate_node", translate_node)
+workflow.add_node("validate_translation_node", validate_translation_node)
 workflow.add_node("compile_node", compile_node)
 workflow.add_node("validate_compile_node", validate_compile_node)
 workflow.add_node("repair_node", repair_node)
@@ -121,7 +134,11 @@ workflow.add_node("judge_node", judge_node)
 workflow.add_node("validate_judge_node", validate_judge_node)
 
 workflow.set_entry_point("translate_node")
-workflow.add_edge("translate_node", "compile_node")
+workflow.add_edge("translate_node", "validate_translation_node")
+workflow.add_conditional_edges(
+    "validate_translation_node",
+    route_after_translation_validation,
+)
 workflow.add_edge("compile_node", "validate_compile_node")
 workflow.add_conditional_edges("validate_compile_node", route_after_compile_validation)
 workflow.add_edge("repair_node", "compile_node")

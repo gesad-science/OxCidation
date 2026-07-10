@@ -24,6 +24,7 @@ logging.basicConfig(
     stream=sys.stderr,
     format="%(asctime)s [SERVER:%(levelname)s] %(message)s",
 )
+logging.getLogger("mcp").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("RustToolkitRunnerServer")

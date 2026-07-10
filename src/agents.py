@@ -15,6 +15,7 @@ from validator import (
 
 logger = logging.getLogger(__name__)
 CLEAR_ERROR_ACTIONS = {
+    "compile_translation",
     "run_visible_tests",
     "run_judge",
     "stop_success",
@@ -81,13 +82,18 @@ class CodeTranslatorAgent:
                 "translate_c_to_rust",
                 arguments=arguments,
             )
-            payload = json.loads(result.content[0].text)
+            response_text = result.content[0].text
+            if result.isError:
+                raise RuntimeError(response_text)
+            payload = json.loads(response_text)
             rust_code = payload.get("rust_code", "")
             prompt_tokens = payload.get("prompt_tokens", 0)
             completion_tokens = payload.get("completion_tokens", 0)
             raw_model_output = payload.get("raw_model_output", rust_code)
-            status = "in_progress"
             errors = payload.get("error", "")
+            status = "in_progress" if rust_code and not errors else "failed"
+            if not errors and not rust_code:
+                errors = "Translation tool returned no Rust code."
         except Exception as exc:
             logger.error(f"[{state['file_name']}] Translation failed: {exc}")
             rust_code = ""
@@ -210,6 +216,23 @@ class CodeValidator:
             state.get("repair_count", 0),
             self.max_repairs,
         )
+        return self._state_from_decision(decision)
+
+    def from_translation(self, state: AgentState) -> AgentState:
+        if state.get("status") == "in_progress" and state.get("rust_code"):
+            decision: ValidationDecision = {
+                "next_action": "compile_translation",
+                "failure_category": "none",
+                "reason": "Translation completed.",
+                "fix_suggestion": "",
+            }
+        else:
+            decision = {
+                "next_action": "stop_failed",
+                "failure_category": "infrastructure",
+                "reason": state.get("errors", "Translation failed."),
+                "fix_suggestion": "",
+            }
         return self._state_from_decision(decision)
 
     def from_tests(self, state: AgentState) -> AgentState:

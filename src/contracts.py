@@ -32,6 +32,7 @@ FailureCategory = Literal[
 ]
 
 NextAction = Literal[
+    "compile_translation",
     "run_visible_tests",
     "run_judge",
     "repair_translation",

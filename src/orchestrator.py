@@ -171,6 +171,11 @@ async def process_file(
     file_path: str,
     mcp_session: ClientSession,
     recorder: RunRecorder,
+    *,
+    output_path: str | None = None,
+    prompt_id: str = "default",
+    prompt_template: str | None = None,
+    record_metadata: dict | None = None,
 ) -> AgentState:
     file_name = os.path.basename(file_path)
     logger.info(f"--- Starting processing for {file_name} ---")
@@ -188,7 +193,10 @@ async def process_file(
         "execution_history": [],
         "test_metrics": {},
         "judge_result": {},
+        "prompt_id": prompt_id,
     }
+    if prompt_template is not None:
+        initial_state["prompt_template"] = prompt_template
 
     result = await app.ainvoke(
         initial_state,
@@ -196,7 +204,8 @@ async def process_file(
     )
 
     out_name = file_name.replace(".c", ".rs")
-    out_path = os.path.join("data/processed/output_rust_files", out_name)
+    out_path = output_path or os.path.join("data/processed/output_rust_files", out_name)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     if result.get("rust_code"):
         with open(out_path, "w") as f:
             f.write(result["rust_code"])
@@ -206,6 +215,7 @@ async def process_file(
     record = {
         "file_name": file_name,
         "final_status": result.get("status", "failed"),
+        "compile_status": result.get("compile_status", "not_reached"),
         "judge_status": judge_result.get("status"),
         "judge_passed": judge_result.get("passed", 0),
         "judge_failed": judge_result.get("failed", 0),
@@ -216,8 +226,11 @@ async def process_file(
         "repair_attempts": result.get("repair_count", 0),
         "visible_tests": result.get("test_metrics", {}),
         "judge": judge_result,
+        "prompt_id": prompt_id,
         **totals,
     }
+    if record_metadata:
+        record.update(record_metadata)
     recorder.write(record)
 
     logger.info(f"[{file_name}] Workflow completed in {totals['duration_sec']:.2f} seconds")

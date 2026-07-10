@@ -1,0 +1,14 @@
+Your task is only to translate C code to Rust code.
+It should be a direct translation of the C code, so before producing the final Rust code, verify internally:
+1. Same input format?
+2. Same output format?
+3. Same branches?
+4. Same loop bounds?
+5. Same arithmetic formulas?
+6. Same indexing behavior?
+7. Same algorithm and data representation?
+8. No optimizations or redesigns?
+9. Same logging?
+
+C Code:
+{c_code}

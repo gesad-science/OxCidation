@@ -447,15 +447,16 @@ def compile_rust_code(source_code: str) -> str:
 
 
 @mcp.tool()
-def translate_c_to_rust(c_code: str) -> str:
+def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
     """
     Translates C code to Rust using an LLM.
     Returns a JSON string containing the rust_code and token usage.
     """
     llm = get_llm()
-    with open("prompts/direct_translation_prompt.txt", "r", encoding="utf-8") as f:
-        prompt_template = f.read()
-    base_prompt = prompt_template.format(c_code=c_code)
+    if prompt_template is None:
+        with open("prompts/direct_translation_prompt.txt", "r", encoding="utf-8") as f:
+            prompt_template = f.read()
+    base_prompt = prompt_template.replace("{c_code}", c_code)
 
     try:
         structured_llm = llm.with_structured_output(
@@ -464,11 +465,11 @@ def translate_c_to_rust(c_code: str) -> str:
         response = structured_llm.invoke(base_prompt)
 
         rust_code = clean_markdown_code(response.rust_code)
+        raw_model_output = response.rust_code
         prompt_tokens = 0
         completion_tokens = 0
 
-        logger.info(f"LLM response type: {type(response)}")
-        logger.info(f"LLM response: {response}")
+        logger.info("Translation completed with structured output.")
 
     except Exception as strict_err:
         logger.warning(
@@ -491,6 +492,7 @@ def translate_c_to_rust(c_code: str) -> str:
 
             raw_rust = parsed_json.get("rust_code", "")
             rust_code = clean_markdown_code(raw_rust)
+            raw_model_output = fallback_response.content
 
             prompt_tokens = (
                 fallback_response.usage_metadata.get("input_tokens", 0)
@@ -512,6 +514,7 @@ def translate_c_to_rust(c_code: str) -> str:
                     "rust_code": "",
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
+                    "raw_model_output": "",
                     "error": f"LLM parsing failed completely: {str(fallback_err)}",
                 }
             )
@@ -520,6 +523,7 @@ def translate_c_to_rust(c_code: str) -> str:
         "rust_code": rust_code,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "raw_model_output": raw_model_output,
     }
 
     return json.dumps(orchestrator_payload)

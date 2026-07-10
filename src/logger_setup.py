@@ -1,40 +1,56 @@
 import os
 import logging
-import json
 from datetime import datetime
+from pathlib import Path
 
-def setup_environment_and_logger(name: str) -> logging.Logger:
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("logs/runs", exist_ok=True)
+def setup_environment_and_logger(name: str, log_dir: str = "logs") -> logging.Logger:
+    configure_log_directory(log_dir)
     os.makedirs("data/processed/input_c_files", exist_ok=True)
     os.makedirs("data/processed/output_rust_files", exist_ok=True)
     os.makedirs("data/processed/judge_tests", exist_ok=True)
+    return logging.getLogger(name)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler("logs/agent.log"),
-            logging.StreamHandler()
-        ]
+
+def configure_log_directory(log_dir: str) -> None:
+    """Route pipeline logs to one directory for the lifetime of a run."""
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    Path(log_dir, "runs").mkdir(parents=True, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    _replace_handlers(
+        root_logger,
+        [
+            _file_handler(os.path.join(log_dir, "agent.log")),
+            logging.StreamHandler(),
+        ],
     )
-    
+
     test_logger = logging.getLogger("tests")
     test_logger.setLevel(logging.INFO)
-    test_handler = logging.FileHandler("logs/tests.log")
-    test_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    test_handler = _file_handler(os.path.join(log_dir, "tests.log"))
     test_logger.propagate = False
-    test_logger.addHandler(test_handler)
-    test_logger.addHandler(logging.StreamHandler())
+    _replace_handlers(test_logger, [test_handler, logging.StreamHandler()])
 
     compact_logger = logging.getLogger("compact")
     compact_logger.setLevel(logging.INFO)
-    compact_handler = logging.FileHandler("logs/compact.log")
-    compact_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    compact_handler = _file_handler(os.path.join(log_dir, "compact.log"))
     compact_logger.propagate = False
-    compact_logger.addHandler(compact_handler)
+    _replace_handlers(compact_logger, [compact_handler])
 
-    return logging.getLogger(name)
+
+def _file_handler(path: str) -> logging.FileHandler:
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    return handler
+
+
+def _replace_handlers(logger: logging.Logger, handlers: list[logging.Handler]) -> None:
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
+    for handler in handlers:
+        logger.addHandler(handler)
 
 
 def log_compact_compile(file_name: str, repair_count: int, compiler_output: str, success: bool):
@@ -86,9 +102,10 @@ def log_compact_judge(
 
 
 class RunRecorder:
-    def __init__(self):
+    def __init__(self, path: str | None = None):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.path = os.path.join("logs", "runs", f"{timestamp}.jsonl")
+        self.path = path or os.path.join("logs", "runs", f"{timestamp}.jsonl")
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, record: dict):
         with open(self.path, "a", encoding="utf-8") as f:

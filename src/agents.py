@@ -34,6 +34,10 @@ class AgentState(TypedDict, total=False):
     file_name: str
     c_code: str
     rust_code: str
+    prompt_id: str
+    prompt_template: str
+    raw_model_output: str
+    compile_status: str
     errors: str
     status: PipelineStatus
     repair_count: int
@@ -70,14 +74,18 @@ class CodeTranslatorAgent:
         started_at = time.time()
 
         try:
+            arguments = {"c_code": state["c_code"]}
+            if state.get("prompt_template") is not None:
+                arguments["prompt_template"] = state["prompt_template"]
             result = await self.mcp_session.call_tool(
                 "translate_c_to_rust",
-                arguments={"c_code": state["c_code"]},
+                arguments=arguments,
             )
             payload = json.loads(result.content[0].text)
             rust_code = payload.get("rust_code", "")
             prompt_tokens = payload.get("prompt_tokens", 0)
             completion_tokens = payload.get("completion_tokens", 0)
+            raw_model_output = payload.get("raw_model_output", rust_code)
             status = "in_progress"
             errors = payload.get("error", "")
         except Exception as exc:
@@ -87,11 +95,13 @@ class CodeTranslatorAgent:
             completion_tokens = 0
             status = "failed"
             errors = f"Translation tool execution failed: {exc}"
+            raw_model_output = ""
 
         return {
             "rust_code": rust_code,
             "status": status,
             "errors": errors,
+            "raw_model_output": raw_model_output,
             "execution_history": _history(
                 state,
                 "translate",
@@ -127,6 +137,7 @@ class CodeTranslatorAgent:
         return {
             "errors": errors,
             "status": status,
+            "compile_status": status,
             "execution_history": _history(state, "compile", started_at),
         }
 

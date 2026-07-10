@@ -184,6 +184,7 @@ pyrightconfig.json
 *.txt
 
 logs/
+outputs/
 Ata de Reunião 09-06 e Planejamento Técnico - Agente de Tradução C para Rust.md
 docs-local/
 docs-local/*
@@ -191,3 +192,7 @@ docs-local/*
 .claude
 test_env.py
 data/processed/output_rust_files/*.rs
+data/processed/benchmark_population*.summary.json
+!prompts/
+!prompts/benchmark/
+!prompts/benchmark/*.txt

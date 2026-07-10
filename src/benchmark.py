@@ -170,7 +170,9 @@ def write_manifest(
         },
         "model": {"provider": configs.llm_provider, "id": configs.llm_model},
         "pipeline": {
+            "config_file": configs.config_file,
             "max_repair_attempts": configs.max_repair_attempts,
+            "request_rate_limit_rpm": configs.request_rate_limit_rpm,
             "judge_backend": configs.judge_backend,
             "judge_time_limit_sec": configs.judge_time_limit_sec,
             "judge_compare_mode": configs.judge_compare_mode,

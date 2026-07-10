@@ -1,4 +1,4 @@
-# LLM provider configuration: openrouter, openai, or ollama
+# LLM provider configuration: openrouter, openai, ollama, or gemini
 provider: ollama
 # Model name for the selected provider
 model: gemma4:latest
@@ -6,6 +6,8 @@ model: gemma4:latest
 base_url: http://localhost:11434
 # Whether the model is allowed to think natively (can be set to false for Ollama APIs)
 think: false
+# Optional global pacing for calls sent to the selected model. Zero disables it.
+request_rate_limit_rpm: 0
 # Repair limit shared by compile, visible-test, and judge feedback loops
 max_repair_attempts: 5
 # Judge backend: auto prefers online-judge-tools when available, python is the local fallback

@@ -13,6 +13,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 from config import ConfigDetails
+from rate_limit import RequestRateLimiter
 
 from dotenv import load_dotenv
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("RustToolkitRunnerServer")
 
 configs = ConfigDetails()
+request_rate_limiter = RequestRateLimiter(configs.request_rate_limit_rpm)
 
 OJ_VERDICT_RE = re.compile(r"\[(?:SUCCESS|FAILURE)\]\s+(AC|WA|TLE|MLE|RE)\b")
 OJ_FAILED_SUMMARY_RE = re.compile(r"test failed:\s+(\d+)\s+AC\s*/\s*(\d+)\s+cases")
@@ -50,6 +52,7 @@ JUDGE_STATUS_PRIORITY = [
 
 class TranslationResult(BaseModel):
     reasoning: str = Field(
+        default="",
         description="Step-by-step reasoning on how to translate the C code."
     )
     rust_code: str = Field(
@@ -97,8 +100,25 @@ def get_llm():
             model=configs.llm_model
         )
 
+    elif provider == "gemini":
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY must be set when provider is gemini.")
+        return ChatOpenAI(
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=api_key,
+            model=configs.llm_model,
+            temperature=0,
+            max_retries=0,
+        )
+
     else:
         raise ValueError(f"Unsupported LLM_PROVIDER: {provider}")
+
+
+def invoke_llm(llm, prompt: str):
+    request_rate_limiter.wait_for_slot()
+    return llm.invoke(prompt)
 
 
 def _compile_c(c_code: str, temp_dir: str):
@@ -462,7 +482,7 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
         structured_llm = llm.with_structured_output(
             TranslationResult, method="json_schema", strict=True
         )
-        response = structured_llm.invoke(base_prompt)
+        response = invoke_llm(structured_llm, base_prompt)
 
         rust_code = clean_markdown_code(response.rust_code)
         raw_model_output = response.rust_code
@@ -487,7 +507,7 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
                 f"{base_prompt}"
             )
 
-            fallback_response = fallback_llm.invoke(fallback_prompt)
+            fallback_response = invoke_llm(fallback_llm, fallback_prompt)
             parsed_json = parser.invoke(fallback_response.content)
 
             raw_rust = parsed_json.get("rust_code", "")
@@ -549,7 +569,7 @@ def repair_rust_code(
     )
     
     try:
-        response = llm.invoke(repair_prompt)
+        response = invoke_llm(llm, repair_prompt)
         repaired_code = clean_markdown_code(response.content)
         logger.info("Repair completed successfully")
         return repaired_code

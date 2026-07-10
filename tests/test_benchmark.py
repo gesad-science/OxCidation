@@ -1,8 +1,16 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from benchmark import Prompt, SourceProgram, build_csv_row, load_sources, select_sources
+from benchmark import (
+    Prompt,
+    SourceProgram,
+    build_csv_row,
+    load_sources,
+    select_sources,
+    server_environment,
+)
 
 
 class BenchmarkSelectionTests(unittest.TestCase):
@@ -56,3 +64,19 @@ class BenchmarkCsvTests(unittest.TestCase):
 
             self.assertEqual(row["judge_wrong_answer_count"], 1)
             self.assertEqual(row["judge_accepted_count"], 0)
+
+
+class BenchmarkProcessTests(unittest.TestCase):
+    def test_server_inherits_the_resolved_config_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "gemini.yaml"
+            config_path.write_text("provider: gemini\n", encoding="utf-8")
+            config = type("Config", (), {"config_file": str(config_path)})()
+
+            environment = server_environment(config)
+
+            self.assertEqual(
+                environment["OXCIDATION_CONFIG_FILE"],
+                str(config_path.resolve()),
+            )
+            self.assertEqual(environment.get("PATH"), os.environ.get("PATH"))

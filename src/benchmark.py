@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -284,6 +285,12 @@ def summarize(rows: list[dict]) -> dict:
     }
 
 
+def server_environment(configs: ConfigDetails) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["OXCIDATION_CONFIG_FILE"] = str(Path(configs.config_file).resolve())
+    return environment
+
+
 async def run_benchmark(args: argparse.Namespace) -> None:
     input_dir = Path(args.input_dir)
     prompt_dir = Path(args.prompts_dir)
@@ -300,7 +307,11 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     csv_path = experiment_dir / "results.csv"
     recorder = RunRecorder(str(experiment_dir / "runs.jsonl"))
     rows = []
-    server_params = StdioServerParameters(command=sys.executable, args=["src/server.py"])
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["src/server.py"],
+        env=server_environment(configs),
+    )
 
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)

@@ -4,5 +4,5 @@ model: gemini-3.1-flash-lite
 request_rate_limit_rpm: 15
 max_repair_attempts: 5
 judge_backend: auto
-judge_time_limit_sec: 5
+visible_test_time_limit_sec: 5
 judge_compare_mode: ignore-spaces-and-newlines

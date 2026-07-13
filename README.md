@@ -22,7 +22,9 @@ Use this command after code changes. It runs the repository's unit tests and pri
 
 ## Configuration
 
-The environment variable `OXCIDATION_CONFIG_FILE` selects the active model configuration. The file defines the provider, model, request pacing, repair limit, and local pipeline Judge settings.
+The environment variable `OXCIDATION_CONFIG_FILE` selects the active model configuration. The file defines the provider, model, request pacing, repair limit, and visible-test settings.
+
+`visible_test_time_limit_sec` controls local visible-test execution. The Judge timeout always comes from CodeNet's `metadata/problem_list.csv`; problems without a numeric CodeNet time limit are recorded as missing baseline data and are not evaluated.
 
 ### Gemini
 
@@ -51,7 +53,7 @@ model: gpt-4.1-mini
 request_rate_limit_rpm: 0
 max_repair_attempts: 5
 judge_backend: auto
-judge_time_limit_sec: 5
+visible_test_time_limit_sec: 5
 judge_compare_mode: ignore-spaces-and-newlines
 ```
 
@@ -134,7 +136,7 @@ The benchmark performs the following work for every `program x prompt` pair:
 1. Translates C to Rust and saves the raw response and concise translation rationale.
 2. Compiles Rust and runs visible tests when they are available.
 3. On a visible differential failure, asks the Validator for semantic diagnosis and repair guidance.
-4. Runs the integrated Judge comparison when both Judge paths are provided.
+4. Runs the Judge node using the configured CodeNet comparison profile.
 
 The integrated comparison first compiles and executes the original C program in a constrained container. Rust is evaluated only when C is accepted on the same Judge cases. This prevents invalid sample I/O, unsupported C baselines, or environment failures from being counted as translation failures.
 
@@ -144,12 +146,11 @@ The command prints the path to `results.csv` when the benchmark completes. It cr
 - `results.csv`: one row per `program x prompt`, suitable for Excel.
 - `summary.json`: aggregate outcomes by prompt.
 - `runs.jsonl`: workflow records from the translation pipeline.
-- `judge_runs.jsonl`: integrated C/Rust Judge comparison records.
 - `model_outputs/<submission_id>/<prompt_id>/`: source C, translated Rust, raw response, translation rationale, test report, Validator report, Judge comparison, and full result JSON.
 
 The C Judge profile uses `gcc:5.4` with `gcc -O2 -pipe source.c -o program -lm`. The Rust profile uses `rust:1.85.0-bookworm`. Per-problem time and memory limits come from `metadata/problem_list.csv`; the stack limit is set to the problem memory limit.
 
-### Translation benchmark without integrated Judge
+### Translation benchmark without a Judge profile
 
 Omit both `--judge-tests-root` and `--metadata-root` when only translation, compilation, and the existing visible-test workflow are needed:
 
@@ -165,7 +166,7 @@ OXCIDATION_CONFIG_FILE=config/gemini-3.1-flash-lite.yaml \
   --seed 42
 ```
 
-In this mode, the legacy local Judge stage remains active. If no local Judge cases exist under `data/processed/judge_tests/<submission_id>/`, it returns `SKIPPED`.
+In this mode, the pipeline reaches the same Judge node, which returns `SKIPPED` because no CodeNet Judge profile was configured. It does not switch to a different Judge implementation.
 
 ## Re-evaluate an Existing Experiment
 

@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-runtime", choices=("podman", "local"), default="podman")
     parser.add_argument("--c-judge-image", default="docker.io/library/gcc:5.4")
     parser.add_argument("--rust-judge-image", default="docker.io/library/rust:1.85.0-bookworm")
+    parser.add_argument("--judge-compare-mode", default="ignore-spaces-and-newlines")
     return parser.parse_args()
 
 
@@ -57,6 +58,7 @@ def main(args: argparse.Namespace) -> None:
         runtime=args.judge_runtime,
         c_image=args.c_judge_image,
         rust_image=args.rust_judge_image,
+        compare_mode=args.judge_compare_mode,
     )
     comparison_runner = JudgeComparison(profile)
     with (experiment_dir / "results.csv").open(newline="", encoding="utf-8") as results_file:

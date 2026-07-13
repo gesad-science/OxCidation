@@ -184,7 +184,7 @@ def write_manifest(
             "max_repair_attempts": configs.max_repair_attempts,
             "request_rate_limit_rpm": configs.request_rate_limit_rpm,
             "judge_backend": configs.judge_backend,
-            "judge_time_limit_sec": configs.judge_time_limit_sec,
+            "visible_test_time_limit_sec": configs.visible_test_time_limit_sec,
             "judge_compare_mode": configs.judge_compare_mode,
         },
         "judge_comparison": (
@@ -195,6 +195,7 @@ def write_manifest(
                 "c_image": judge_profile.c_image,
                 "rust_image": judge_profile.rust_image,
                 "backend": judge_profile.backend,
+                "compare_mode": judge_profile.compare_mode,
                 "tests_root": str(judge_profile.tests_root),
                 "metadata_root": str(judge_profile.metadata_root),
                 "c_compile_command": "gcc -O2 -pipe source.c -o program -lm",
@@ -360,6 +361,7 @@ def build_judge_comparison(args: argparse.Namespace, configs: ConfigDetails) -> 
         c_image=args.c_judge_image,
         rust_image=args.rust_judge_image,
         backend=configs.judge_backend,
+        compare_mode=configs.judge_compare_mode,
     )
     return JudgeComparison(profile)
 
@@ -388,9 +390,6 @@ async def run_benchmark(args: argparse.Namespace) -> None:
 
     csv_path = experiment_dir / "results.csv"
     recorder = RunRecorder(str(experiment_dir / "runs.jsonl"))
-    judge_recorder = (
-        RunRecorder(str(experiment_dir / "judge_runs.jsonl")) if judge_comparison else None
-    )
     rows = []
     server_params = StdioServerParameters(
         command=sys.executable,
@@ -427,27 +426,9 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                                 "model_provider": configs.llm_provider,
                                 "model_id": configs.llm_model,
                             },
-                            run_judge=judge_comparison is None,
+                            problem_id=source.problem_id,
+                            judge_comparison=judge_comparison,
                         )
-                        if judge_comparison is not None:
-                            baseline = judge_comparison.evaluate(
-                                source.path.stem,
-                                source.problem_id,
-                                source.path.read_text(encoding="utf-8"),
-                                result.get("rust_code", ""),
-                            )
-                            result["baseline_judge"] = baseline
-                            if baseline["baseline_status"] == "valid":
-                                result["judge_result"] = baseline["rust"]["judge"]
-                            judge_recorder.write(
-                                {
-                                    "experiment_id": args.experiment_id,
-                                    "snippet_id": source.path.stem,
-                                    "problem_id": source.problem_id,
-                                    "prompt_id": prompt.prompt_id,
-                                    "baseline_judge": baseline,
-                                }
-                            )
                         write_artifacts(artifact_dir, source, result)
                         row = build_csv_row(
                             args.experiment_id,

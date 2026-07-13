@@ -18,7 +18,7 @@ class ConfigDetails:
         self.think = self.config_data.get("think", True)
         self.request_rate_limit_rpm = self.config_data.get("request_rate_limit_rpm", 0)
         self.judge_backend = self.config_data.get("judge_backend", "auto")
-        self.judge_time_limit_sec = self.config_data.get("judge_time_limit_sec", 5)
+        self.visible_test_time_limit_sec = self.config_data.get("visible_test_time_limit_sec", 5)
         self.judge_compare_mode = self.config_data.get(
             "judge_compare_mode",
             "ignore-spaces-and-newlines",

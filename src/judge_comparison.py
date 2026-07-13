@@ -1,7 +1,6 @@
 """Reproducible C/Rust Judge comparison for benchmark artifacts."""
 
 import csv
-import json
 import os
 import shlex
 import shutil
@@ -10,13 +9,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from server import (
-    _compile_c,
-    _compile_rust,
-    _judge_result,
-    _list_input_cases,
-    _run_oj_suite,
-    _run_python_io_suite,
+from judge_execution import (
+    compile_c,
+    compile_rust,
+    judge_result,
+    list_input_cases,
+    run_oj_suite,
+    run_python_io_suite,
 )
 
 
@@ -34,6 +33,7 @@ class JudgeProfile:
     c_image: str = "docker.io/library/gcc:5.4"
     rust_image: str = "docker.io/library/rust:1.85.0-bookworm"
     backend: str = "auto"
+    compare_mode: str = "ignore-spaces-and-newlines"
 
 
 class JudgeComparison:
@@ -62,10 +62,10 @@ class JudgeComparison:
             if test_directory is None:
                 return self._skipped_comparison("No matching Judge cases were found.")
 
-            report_directory = self.profile.tests_root / (
-                snippet_id if test_layout == "io-directory" and (self.profile.tests_root / snippet_id).is_dir()
-                else problem_id
-            )
+            report_key = problem_id
+            if test_layout == "io-directory" and (self.profile.tests_root / snippet_id).is_dir():
+                report_key = snippet_id
+            report_directory = self.profile.tests_root / report_key
             c_result = evaluate_program("c", c_code, test_directory, limits, self.profile)
             if c_result["judge"]["status"] != "ACCEPTED":
                 return {
@@ -122,7 +122,7 @@ def resolve_test_directory(
 ) -> tuple[Path | None, str]:
     for key in (snippet_id, problem_id):
         candidate = tests_root / key
-        if candidate.is_dir() and _list_input_cases(str(candidate)):
+        if candidate.is_dir() and list_input_cases(str(candidate)):
             return candidate, "io-directory"
 
         input_path = candidate / "input.txt"
@@ -140,7 +140,7 @@ def skipped_program(reason: str) -> dict:
     return {
         "compile_status": "not_run",
         "compiler_output": "",
-        "judge": _judge_result("SKIPPED", 0, 0, 0, 0, reason),
+        "judge": judge_result("SKIPPED", 0, 0, 0, 0, reason),
     }
 
 
@@ -154,11 +154,11 @@ def evaluate_program(
     with tempfile.TemporaryDirectory(prefix="oxcidation-judge-program-") as temp_dir:
         compiler_output, executable = compile_program(language, source_code, Path(temp_dir), profile)
         if executable is None:
-            total = len(_list_input_cases(str(test_directory)))
+            total = len(list_input_cases(str(test_directory)))
             return {
                 "compile_status": "failed",
                 "compiler_output": compiler_output,
-                "judge": _judge_result("COMPILATION_ERROR", 0, total, total, 0, compiler_output),
+                "judge": judge_result("COMPILATION_ERROR", 0, total, total, 0, compiler_output),
             }
 
         container_id = start_execution_container(
@@ -171,18 +171,18 @@ def evaluate_program(
             return {
                 "compile_status": "success",
                 "compiler_output": compiler_output,
-                "judge": _judge_result(
+                "judge": judge_result(
                     "INFRA_ERROR",
                     0,
                     0,
-                    len(_list_input_cases(str(test_directory))),
+                    len(list_input_cases(str(test_directory))),
                     0,
                     "Could not start the constrained Judge container.",
                 ),
             }
         try:
             command = execution_command(executable, profile, container_id)
-            judge_result = run_judge_suite(test_directory, command, limits.time_limit_ms, profile.backend)
+            judge_result = run_judge_suite(test_directory, command, limits.time_limit_ms, profile)
         finally:
             stop_execution_container(container_id, profile)
         return {
@@ -200,9 +200,9 @@ def compile_program(
 ) -> tuple[str, Path | None]:
     if profile.runtime == "local":
         result, executable = (
-            _compile_c(source_code, str(work_dir))
+            compile_c(source_code, str(work_dir))
             if language == "c"
-            else _compile_rust(source_code, str(work_dir))
+            else compile_rust(source_code, str(work_dir))
         )
         return result.stderr, Path(executable) if result.returncode == 0 else None
 
@@ -213,7 +213,15 @@ def compile_program(
     source_path.write_text(source_code, encoding="utf-8")
     os.chmod(source_path, 0o644)
     image = profile.c_image if language == "c" else profile.rust_image
-    compiler = ["gcc", "-O2", "-pipe", f"/work/{source_name}", "-o", f"/work/{executable_name}", "-lm"]
+    compiler = [
+        "gcc",
+        "-O2",
+        "-pipe",
+        f"/work/{source_name}",
+        "-o",
+        f"/work/{executable_name}",
+        "-lm",
+    ]
     if language == "rust":
         compiler = ["rustc", "-O", f"/work/{source_name}", "-o", f"/work/{executable_name}"]
     command = [
@@ -291,22 +299,18 @@ def run_judge_suite(
     test_directory: Path,
     command: str,
     time_limit_ms: int,
-    backend: str,
+    profile: JudgeProfile,
 ) -> dict:
     timeout_sec = time_limit_ms / 1000
-    if backend in {"auto", "oj"} and shutil.which("oj"):
-        return _run_oj_suite(str(test_directory), command, timeout_sec)
+    if profile.backend in {"auto", "oj"} and shutil.which("oj"):
+        return run_oj_suite(str(test_directory), command, timeout_sec, profile.compare_mode)
     if " " not in command:
-        return _run_python_io_suite(str(test_directory), command, timeout_sec)
-    return _judge_result(
+        return run_python_io_suite(str(test_directory), command, timeout_sec)
+    return judge_result(
         "INFRA_ERROR",
         0,
         0,
-        len(_list_input_cases(str(test_directory))),
+        len(list_input_cases(str(test_directory))),
         0,
         "online-judge-tools is required for containerized Judge execution.",
     )
-
-
-def comparison_to_json(comparison: dict) -> str:
-    return json.dumps(comparison, ensure_ascii=False, indent=2)

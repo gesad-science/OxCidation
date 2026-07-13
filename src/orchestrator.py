@@ -51,6 +51,10 @@ def _mcp_session(config: RunnableConfig) -> ClientSession:
     return config["configurable"]["mcp_session"]
 
 
+def _judge_comparison(config: RunnableConfig):
+    return config["configurable"].get("judge_comparison")
+
+
 def _route(decision: ValidationDecision, mapping: dict):
     return mapping.get(decision["next_action"], END)
 
@@ -64,8 +68,6 @@ def route_after_translation_validation(state: AgentState):
 
 
 def route_after_visible_validation(state: AgentState):
-    if state.get("skip_judge") and state["validation_decision"]["next_action"] == "run_judge":
-        return END
     return _route(state["validation_decision"], VISIBLE_TEST_ROUTES)
 
 
@@ -127,7 +129,7 @@ async def judge_node(
     state: AgentState,
     config: RunnableConfig,
 ) -> AgentState:
-    return await CodeEvaluator(_mcp_session(config)).evaluate(state)
+    return await CodeEvaluator(_judge_comparison(config)).evaluate(state)
 
 
 async def validate_judge_node(state: AgentState) -> AgentState:
@@ -207,7 +209,8 @@ async def process_file(
     prompt_id: str = "default",
     prompt_template: str | None = None,
     record_metadata: dict | None = None,
-    run_judge: bool = True,
+    problem_id: str = "",
+    judge_comparison=None,
 ) -> AgentState:
     file_name = os.path.basename(file_path)
     logger.info(f"--- Starting processing for {file_name} ---")
@@ -217,6 +220,7 @@ async def process_file(
 
     initial_state = {
         "file_name": file_name,
+        "problem_id": problem_id,
         "c_code": c_code,
         "rust_code": "",
         "status": "in_progress",
@@ -225,7 +229,6 @@ async def process_file(
         "execution_history": [],
         "test_metrics": {},
         "judge_result": {},
-        "skip_judge": not run_judge,
         "prompt_id": prompt_id,
     }
     if prompt_template is not None:
@@ -233,7 +236,12 @@ async def process_file(
 
     result = await app.ainvoke(
         initial_state,
-        config={"configurable": {"mcp_session": mcp_session}},
+        config={
+            "configurable": {
+                "mcp_session": mcp_session,
+                "judge_comparison": judge_comparison,
+            }
+        },
     )
 
     out_name = file_name.replace(".c", ".rs")
@@ -260,6 +268,7 @@ async def process_file(
         "visible_tests": result.get("test_metrics", {}),
         "translation_reasoning": result.get("translation_reasoning", ""),
         "validator_report": result.get("validator_report", {}),
+        "baseline_judge": result.get("baseline_judge", {}),
         "judge": judge_result,
         "prompt_id": prompt_id,
         **totals,

@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from typing import List, TypedDict
+from typing import TYPE_CHECKING, List, TypedDict
 
 from mcp import ClientSession
 
@@ -12,6 +12,9 @@ from validator import (
     validate_judge_result,
     validate_visible_tests,
 )
+
+if TYPE_CHECKING:
+    from judge_comparison import JudgeComparison
 
 logger = logging.getLogger(__name__)
 CLEAR_ERROR_ACTIONS = {
@@ -33,6 +36,7 @@ class StepLog(TypedDict):
 
 class AgentState(TypedDict, total=False):
     file_name: str
+    problem_id: str
     c_code: str
     rust_code: str
     prompt_id: str
@@ -48,7 +52,7 @@ class AgentState(TypedDict, total=False):
     test_metrics: dict
     validator_report: ValidatorReport
     judge_result: JudgeResult
-    skip_judge: bool
+    baseline_judge: dict
     validation_decision: ValidationDecision
 
 
@@ -351,22 +355,37 @@ def _status_after_judge(
 
 
 class CodeEvaluator:
-    def __init__(self, mcp_session: ClientSession):
-        self.mcp_session = mcp_session
+    def __init__(
+        self,
+        judge_comparison: "JudgeComparison | None" = None,
+    ):
+        self.judge_comparison = judge_comparison
 
     async def evaluate(self, state: AgentState) -> AgentState:
         logger.info(f"[{state['file_name']}] Evaluator: running judge validation")
         started_at = time.time()
 
         try:
-            result = await self.mcp_session.call_tool(
-                "evaluate_judge_cases",
-                arguments={
-                    "file_name": state["file_name"],
-                    "rust_code": state.get("rust_code", ""),
-                },
-            )
-            judge_result = json.loads(result.content[0].text)
+            if self.judge_comparison is None:
+                baseline_judge = {
+                    "baseline_status": "not_configured",
+                    "c": {},
+                    "rust": {
+                        "judge": {
+                            "status": "SKIPPED",
+                            "details": "No CodeNet Judge profile was configured.",
+                        }
+                    },
+                }
+            else:
+                baseline_judge = self.judge_comparison.evaluate(
+                    state["file_name"].removesuffix(".c"),
+                    state["problem_id"],
+                    state["c_code"],
+                    state.get("rust_code", ""),
+                )
+
+            judge_result = baseline_judge["rust"]["judge"]
             judge_status = judge_result.get("status", "INFRA_ERROR")
             errors = ""
             log_compact_judge(
@@ -376,6 +395,11 @@ class CodeEvaluator:
                 judge_result.get("verdict_counts", {}),
             )
         except Exception as exc:
+            baseline_judge = {
+                "baseline_status": "infrastructure_error",
+                "c": {},
+                "rust": {},
+            }
             judge_result = {
                 "status": "INFRA_ERROR",
                 "passed": 0,
@@ -392,5 +416,6 @@ class CodeEvaluator:
             "status": state.get("status", "success"),
             "errors": errors,
             "judge_result": judge_result,
+            "baseline_judge": baseline_judge,
             "execution_history": _history(state, "judge", started_at),
         }

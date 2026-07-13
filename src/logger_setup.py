@@ -8,7 +8,6 @@ def setup_environment_and_logger(name: str, log_dir: str = "logs") -> logging.Lo
     configure_log_directory(log_dir)
     os.makedirs("data/processed/input_c_files", exist_ok=True)
     os.makedirs("data/processed/output_rust_files", exist_ok=True)
-    os.makedirs("data/processed/judge_tests", exist_ok=True)
     return logging.getLogger(name)
 
 

@@ -3,7 +3,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from agents import CodeValidator
+from agents import CodeEvaluator, CodeValidator
 
 
 class TranslationValidationTests(unittest.TestCase):
@@ -96,6 +96,21 @@ class TranslationValidationTests(unittest.TestCase):
         self.assertEqual(result["validator_report"]["status"], "not_required")
         self.assertIsNone(session.tool_name)
 
+    def test_evaluator_uses_the_configured_c_rust_judge_comparison(self):
+        comparison = _FakeJudgeComparison()
+        state = {
+            "file_name": "sample.c",
+            "problem_id": "p00001",
+            "c_code": "int main(void) { return 0; }",
+            "rust_code": "fn main() {}",
+        }
+
+        result = asyncio.run(CodeEvaluator(comparison).evaluate(state))
+
+        self.assertEqual(comparison.arguments[0:2], ("sample", "p00001"))
+        self.assertEqual(result["judge_result"]["status"], "ACCEPTED")
+        self.assertEqual(result["baseline_judge"]["baseline_status"], "valid")
+
 
 class _FakeSession:
     def __init__(self, payload):
@@ -110,3 +125,22 @@ class _FakeSession:
             content=[SimpleNamespace(text=json.dumps(self.payload))],
             isError=False,
         )
+
+
+class _FakeJudgeComparison:
+    def __init__(self):
+        self.arguments = None
+
+    def evaluate(self, *arguments):
+        self.arguments = arguments
+        return {
+            "baseline_status": "valid",
+            "c": {"judge": {"status": "ACCEPTED"}},
+            "rust": {
+                "judge": {
+                    "status": "ACCEPTED",
+                    "details": "C and Rust passed.",
+                    "verdict_counts": {"ACCEPTED": 1},
+                }
+            },
+        }

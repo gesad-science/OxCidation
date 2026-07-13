@@ -10,7 +10,7 @@ from judge_comparison import (
     start_execution_container,
     resolve_test_directory,
 )
-from server import _judge_result
+from judge_execution import judge_result
 
 
 class SmokeJudgeTestDirectoryTests(unittest.TestCase):
@@ -94,7 +94,7 @@ class SmokeJudgeTestDirectoryTests(unittest.TestCase):
             failed_c = {
                 "compile_status": "success",
                 "compiler_output": "",
-                "judge": _judge_result("WRONG_ANSWER", 0, 1, 1, 1, "C output differs."),
+                "judge": judge_result("WRONG_ANSWER", 0, 1, 1, 1, "C output differs."),
             }
 
             with patch("judge_comparison.evaluate_program", return_value=failed_c) as evaluate:

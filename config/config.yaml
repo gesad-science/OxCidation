@@ -10,7 +10,7 @@ think: false
 request_rate_limit_rpm: 0
 # Repair limit shared by compile, visible-test, and judge feedback loops
 max_repair_attempts: 5
-# Judge backend: auto prefers online-judge-tools when available, python is the local fallback
+# Judge backend: auto prefers online-judge-tools when available.
 judge_backend: auto
-judge_time_limit_sec: 5
+visible_test_time_limit_sec: 5
 judge_compare_mode: ignore-spaces-and-newlines

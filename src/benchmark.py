@@ -19,6 +19,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from config import ConfigDetails
+from judge_comparison import JudgeComparison, JudgeProfile
 from logger_setup import RunRecorder, configure_log_directory
 from orchestrator import process_file
 
@@ -47,6 +48,10 @@ CSV_FIELDS = (
     "visible_test_status",
     "visible_cases_total",
     "visible_cases_passed",
+    "baseline_status",
+    "baseline_test_layout",
+    "baseline_c_compile_status",
+    "baseline_c_judge_status",
     "judge_status",
     "judge_cases_total",
     "judge_cases_passed",
@@ -58,6 +63,9 @@ CSV_FIELDS = (
     "prompt_tokens",
     "completion_tokens",
     "raw_output_path",
+    "translation_reasoning_path",
+    "test_report_path",
+    "validator_report_path",
     "translated_code_path",
     "result_path",
 ) + tuple(f"judge_{verdict.lower()}_count" for verdict in VERDICTS)
@@ -139,11 +147,11 @@ def create_experiment_dir(root_dir: Path, experiment_id: str) -> Path:
     if not PROMPT_ID_RE.fullmatch(experiment_id):
         raise ValueError("Experiment id may contain only letters, numbers, dots, underscores, and hyphens.")
     experiment_dir = root_dir / experiment_id
-    if experiment_dir.exists():
+    if experiment_dir.exists() and any(experiment_dir.iterdir()):
         raise FileExistsError(
             f"Experiment directory already exists: {experiment_dir}. Choose a new id to avoid mixing results."
         )
-    experiment_dir.mkdir(parents=True)
+    experiment_dir.mkdir(parents=True, exist_ok=True)
     return experiment_dir
 
 
@@ -154,6 +162,7 @@ def write_manifest(
     prompts: list[Prompt],
     seed: int,
     configs: ConfigDetails,
+    judge_profile: JudgeProfile | None,
 ) -> None:
     manifest = {
         "experiment_id": experiment_id,
@@ -178,6 +187,21 @@ def write_manifest(
             "judge_time_limit_sec": configs.judge_time_limit_sec,
             "judge_compare_mode": configs.judge_compare_mode,
         },
+        "judge_comparison": (
+            None
+            if judge_profile is None
+            else {
+                "runtime": judge_profile.runtime,
+                "c_image": judge_profile.c_image,
+                "rust_image": judge_profile.rust_image,
+                "backend": judge_profile.backend,
+                "tests_root": str(judge_profile.tests_root),
+                "metadata_root": str(judge_profile.metadata_root),
+                "c_compile_command": "gcc -O2 -pipe source.c -o program -lm",
+                "rust_compile_command": "rustc -O source.rs -o program",
+                "stack_policy": "problem_memory_limit",
+            }
+        ),
         "prompts": [
             {
                 "prompt_id": prompt.prompt_id,
@@ -206,6 +230,8 @@ def build_csv_row(
     experiment_dir: Path,
 ) -> dict:
     visible = result.get("test_metrics", {})
+    baseline = result.get("baseline_judge", {})
+    baseline_c = baseline.get("c", {})
     judge = result.get("judge_result", {})
     verdict_counts = judge.get("verdict_counts", {})
     first_failure = judge.get("first_failure", {})
@@ -226,6 +252,10 @@ def build_csv_row(
         "visible_test_status": visible.get("status", "not_reached"),
         "visible_cases_total": visible.get("total_tests", 0),
         "visible_cases_passed": visible.get("rust_passed", 0),
+        "baseline_status": baseline.get("baseline_status", "not_configured"),
+        "baseline_test_layout": baseline.get("test_layout", ""),
+        "baseline_c_compile_status": baseline_c.get("compile_status", "not_run"),
+        "baseline_c_judge_status": baseline_c.get("judge", {}).get("status", "not_run"),
         "judge_status": judge.get("status", "not_reached"),
         "judge_cases_total": judge.get("total", 0),
         "judge_cases_passed": judge.get("passed", 0),
@@ -237,6 +267,13 @@ def build_csv_row(
         "prompt_tokens": sum(step.get("prompt_tokens", 0) for step in totals),
         "completion_tokens": sum(step.get("completion_tokens", 0) for step in totals),
         "raw_output_path": str((artifact_dir / "raw_response.txt").relative_to(experiment_dir)),
+        "translation_reasoning_path": str(
+            (artifact_dir / "translation_reasoning.txt").relative_to(experiment_dir)
+        ),
+        "test_report_path": str((artifact_dir / "test_report.json").relative_to(experiment_dir)),
+        "validator_report_path": str(
+            (artifact_dir / "validator_report.json").relative_to(experiment_dir)
+        ),
         "translated_code_path": str((artifact_dir / "translated.rs").relative_to(experiment_dir)),
         "result_path": str((artifact_dir / "result.json").relative_to(experiment_dir)),
     }
@@ -251,6 +288,21 @@ def write_artifacts(artifact_dir: Path, source: SourceProgram, result: dict) -> 
     (artifact_dir / "raw_response.txt").write_text(
         result.get("raw_model_output", ""), encoding="utf-8"
     )
+    (artifact_dir / "translation_reasoning.txt").write_text(
+        result.get("translation_reasoning", ""), encoding="utf-8"
+    )
+    (artifact_dir / "test_report.json").write_text(
+        json.dumps(result.get("test_metrics", {}), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "validator_report.json").write_text(
+        json.dumps(result.get("validator_report", {}), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "judge_comparison.json").write_text(
+        json.dumps(result.get("baseline_judge", {}), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     (artifact_dir / "translated.rs").write_text(result.get("rust_code", ""), encoding="utf-8")
     (artifact_dir / "result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -264,6 +316,8 @@ def summarize(rows: list[dict]) -> dict:
             "final_status": Counter(),
             "judge_status": Counter(),
             "judge_verdict_counts": Counter(),
+            "baseline_status": Counter(),
+            "baseline_c_judge_status": Counter(),
         }
     )
     for row in rows:
@@ -271,6 +325,8 @@ def summarize(rows: list[dict]) -> dict:
         summary["runs"] += 1
         summary["final_status"][row["final_status"]] += 1
         summary["judge_status"][row["judge_status"]] += 1
+        summary["baseline_status"][row["baseline_status"]] += 1
+        summary["baseline_c_judge_status"][row["baseline_c_judge_status"]] += 1
         for verdict in VERDICTS:
             summary["judge_verdict_counts"][verdict] += int(row[f"judge_{verdict.lower()}_count"])
     return {
@@ -291,6 +347,23 @@ def server_environment(configs: ConfigDetails) -> dict[str, str]:
     return environment
 
 
+def build_judge_comparison(args: argparse.Namespace, configs: ConfigDetails) -> JudgeComparison | None:
+    configured_values = (args.judge_tests_root, args.metadata_root)
+    if not any(configured_values):
+        return None
+    if not all(configured_values):
+        raise ValueError("--judge-tests-root and --metadata-root must be provided together.")
+    profile = JudgeProfile(
+        tests_root=Path(args.judge_tests_root),
+        metadata_root=Path(args.metadata_root),
+        runtime=args.judge_runtime,
+        c_image=args.c_judge_image,
+        rust_image=args.rust_judge_image,
+        backend=configs.judge_backend,
+    )
+    return JudgeComparison(profile)
+
+
 async def run_benchmark(args: argparse.Namespace) -> None:
     input_dir = Path(args.input_dir)
     prompt_dir = Path(args.prompts_dir)
@@ -299,13 +372,25 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     source_manifest = Path(args.source_manifest) if args.source_manifest else None
     population = load_sources(input_dir, source_manifest)
     sources = select_sources(population, args.sample_size, args.seed)
-    experiment_dir = create_experiment_dir(root_dir, args.experiment_id)
     configs = ConfigDetails()
-    write_manifest(experiment_dir, args.experiment_id, sources, prompts, args.seed, configs)
+    judge_comparison = build_judge_comparison(args, configs)
+    experiment_dir = create_experiment_dir(root_dir, args.experiment_id)
+    write_manifest(
+        experiment_dir,
+        args.experiment_id,
+        sources,
+        prompts,
+        args.seed,
+        configs,
+        judge_comparison.profile if judge_comparison else None,
+    )
     configure_log_directory(str(experiment_dir / "logs"))
 
     csv_path = experiment_dir / "results.csv"
     recorder = RunRecorder(str(experiment_dir / "runs.jsonl"))
+    judge_recorder = (
+        RunRecorder(str(experiment_dir / "judge_runs.jsonl")) if judge_comparison else None
+    )
     rows = []
     server_params = StdioServerParameters(
         command=sys.executable,
@@ -342,7 +427,27 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                                 "model_provider": configs.llm_provider,
                                 "model_id": configs.llm_model,
                             },
+                            run_judge=judge_comparison is None,
                         )
+                        if judge_comparison is not None:
+                            baseline = judge_comparison.evaluate(
+                                source.path.stem,
+                                source.problem_id,
+                                source.path.read_text(encoding="utf-8"),
+                                result.get("rust_code", ""),
+                            )
+                            result["baseline_judge"] = baseline
+                            if baseline["baseline_status"] == "valid":
+                                result["judge_result"] = baseline["rust"]["judge"]
+                            judge_recorder.write(
+                                {
+                                    "experiment_id": args.experiment_id,
+                                    "snippet_id": source.path.stem,
+                                    "problem_id": source.problem_id,
+                                    "prompt_id": prompt.prompt_id,
+                                    "baseline_judge": baseline,
+                                }
+                            )
                         write_artifacts(artifact_dir, source, result)
                         row = build_csv_row(
                             args.experiment_id,
@@ -375,6 +480,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="outputs")
     parser.add_argument("--sample-size", type=int, default=324)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--judge-tests-root",
+        help="Judge case root, with directories keyed by submission_id or problem_id.",
+    )
+    parser.add_argument(
+        "--metadata-root",
+        help="CodeNet metadata directory containing problem_list.csv.",
+    )
+    parser.add_argument("--judge-runtime", choices=("podman", "local"), default="podman")
+    parser.add_argument("--c-judge-image", default="docker.io/library/gcc:5.4")
+    parser.add_argument("--rust-judge-image", default="docker.io/library/rust:1.85.0-bookworm")
     return parser.parse_args()
 
 

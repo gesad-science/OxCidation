@@ -7,6 +7,7 @@ from benchmark import (
     Prompt,
     SourceProgram,
     build_csv_row,
+    create_experiment_dir,
     load_sources,
     select_sources,
     server_environment,
@@ -50,6 +51,8 @@ class BenchmarkCsvTests(unittest.TestCase):
                 "test_metrics": {"status": "success", "total_tests": 2, "rust_passed": 2},
                 "judge_result": {"status": "WRONG_ANSWER", "total": 3, "passed": 2, "failed": 1, "verdict_counts": {"WRONG_ANSWER": 1}},
                 "execution_history": [],
+                "translation_reasoning": "Preserved the loop bounds.",
+                "validator_report": {"status": "not_required"},
             }
 
             row = build_csv_row(
@@ -64,9 +67,19 @@ class BenchmarkCsvTests(unittest.TestCase):
 
             self.assertEqual(row["judge_wrong_answer_count"], 1)
             self.assertEqual(row["judge_accepted_count"], 0)
+            self.assertTrue(row["translation_reasoning_path"].endswith("translation_reasoning.txt"))
 
 
 class BenchmarkProcessTests(unittest.TestCase):
+    def test_reuses_an_empty_experiment_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "retry").mkdir()
+
+            experiment_dir = create_experiment_dir(root, "retry")
+
+            self.assertEqual(experiment_dir, root / "retry")
+
     def test_server_inherits_the_resolved_config_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "gemini.yaml"

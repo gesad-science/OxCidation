@@ -51,10 +51,19 @@ class TranslationRequest(TypedDict, total=False):
 
 class TranslationResult(TypedDict, total=False):
     rust_code: str
+    translation_reasoning: str
     status: PipelineStatus
     errors: str
     prompt_tokens: int
     completion_tokens: int
+
+
+class ValidatorReport(TypedDict, total=False):
+    status: str
+    diagnosis: str
+    repair_guidance: str
+    semantic_discrepancies: list[str]
+    error: str
 
 
 class RepairRequest(TypedDict):

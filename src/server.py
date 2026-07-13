@@ -53,11 +53,18 @@ JUDGE_STATUS_PRIORITY = [
 
 class TranslationResult(BaseModel):
     reasoning: str = Field(
-        default="",
-        description="Step-by-step reasoning on how to translate the C code."
+        description="A concise translation rationale without hidden chain-of-thought."
     )
     rust_code: str = Field(
         description="The raw, unformatted Rust code. Do not use markdown backticks."
+    )
+
+
+class SemanticValidationResult(BaseModel):
+    diagnosis: str = Field(description="Concise diagnosis of the differential test failure.")
+    repair_guidance: str = Field(description="Concrete repair guidance for the Rust translation.")
+    semantic_discrepancies: list[str] = Field(
+        description="Likely semantic discrepancies supported by the test report."
     )
 
 
@@ -478,15 +485,21 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
         with open("prompts/direct_translation_prompt.txt", "r", encoding="utf-8") as f:
             prompt_template = f.read()
     base_prompt = prompt_template.replace("{c_code}", c_code)
+    structured_prompt = (
+        f"{base_prompt}\n\n"
+        "For the structured response, include a concise translation rationale that lists "
+        "the important behavior-preserving choices. Do not provide hidden chain-of-thought."
+    )
 
     try:
         structured_llm = llm.with_structured_output(
             TranslationResult, method="json_schema", strict=True
         )
-        response = invoke_llm(structured_llm, base_prompt)
+        response = invoke_llm(structured_llm, structured_prompt)
 
         rust_code = clean_markdown_code(response.rust_code)
         raw_model_output = response.rust_code
+        translation_reasoning = response.reasoning
         prompt_tokens = 0
         completion_tokens = 0
 
@@ -505,7 +518,7 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
             fallback_prompt = (
                 "You are an expert C to Rust translator.\n"
                 f"{parser.get_format_instructions()}\n\n"
-                f"{base_prompt}"
+                f"{structured_prompt}"
             )
 
             fallback_response = invoke_llm(fallback_llm, fallback_prompt)
@@ -514,6 +527,7 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
             raw_rust = parsed_json.get("rust_code", "")
             rust_code = clean_markdown_code(raw_rust)
             raw_model_output = fallback_response.content
+            translation_reasoning = parsed_json.get("reasoning", "")
 
             prompt_tokens = (
                 fallback_response.usage_metadata.get("input_tokens", 0)
@@ -536,6 +550,7 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "raw_model_output": "",
+                    "translation_reasoning": "",
                     "error": f"LLM parsing failed completely: {str(fallback_err)}",
                 }
             )
@@ -545,6 +560,7 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "raw_model_output": raw_model_output,
+        "translation_reasoning": translation_reasoning,
     }
 
     return json.dumps(orchestrator_payload)
@@ -577,6 +593,46 @@ def repair_rust_code(
     except Exception as e:
         logger.error(f"Repair failed: {str(e)}")
         return ""
+
+
+@mcp.tool()
+def analyze_translation_discrepancy(
+    c_code: str,
+    rust_code: str,
+    test_report: dict,
+) -> str:
+    """Diagnoses visible differential test failures and returns repair guidance."""
+    llm = get_llm()
+    report_json = json.dumps(test_report, ensure_ascii=False)
+    analysis_prompt = (
+        "You are a code validation specialist for behavior-preserving C to Rust translation.\n"
+        "Analyze the C source, Rust translation, and differential visible-test report below. "
+        "Identify only discrepancies supported by the report or source comparison. "
+        "Provide concise, concrete repair guidance without redesigning the algorithm. "
+        "Do not reveal hidden chain-of-thought.\n\n"
+        f"C source:\n{c_code}\n\n"
+        f"Rust translation:\n{rust_code}\n\n"
+        f"Differential test report:\n{report_json}"
+    )
+
+    try:
+        structured_llm = llm.with_structured_output(
+            SemanticValidationResult,
+            method="json_schema",
+            strict=True,
+        )
+        response = invoke_llm(structured_llm, analysis_prompt)
+        return json.dumps(response.model_dump())
+    except Exception as strict_err:
+        logger.warning("Structured validator analysis failed: %s", strict_err)
+        try:
+            fallback_llm = llm.bind(response_format={"type": "json_object"})
+            parser = JsonOutputParser(pydantic_object=SemanticValidationResult)
+            fallback_prompt = f"{parser.get_format_instructions()}\n\n{analysis_prompt}"
+            response = invoke_llm(fallback_llm, fallback_prompt)
+            return json.dumps(parser.invoke(response.content))
+        except Exception as fallback_err:
+            raise RuntimeError(f"Validator analysis failed: {fallback_err}") from fallback_err
 
 
 @mcp.tool()

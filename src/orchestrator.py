@@ -64,6 +64,8 @@ def route_after_translation_validation(state: AgentState):
 
 
 def route_after_visible_validation(state: AgentState):
+    if state.get("skip_judge") and state["validation_decision"]["next_action"] == "run_judge":
+        return END
     return _route(state["validation_decision"], VISIBLE_TEST_ROUTES)
 
 
@@ -107,6 +109,16 @@ async def test_node(
     return await TesterAgent(_mcp_session(config)).run_suite(state)
 
 
+async def analyze_visible_node(
+    state: AgentState,
+    config: RunnableConfig,
+) -> AgentState:
+    return await CodeValidator(configs.max_repair_attempts).analyze_test_report(
+        state,
+        _mcp_session(config),
+    )
+
+
 async def validate_visible_node(state: AgentState) -> AgentState:
     return CodeValidator(configs.max_repair_attempts).from_tests(state)
 
@@ -129,6 +141,7 @@ workflow.add_node("compile_node", compile_node)
 workflow.add_node("validate_compile_node", validate_compile_node)
 workflow.add_node("repair_node", repair_node)
 workflow.add_node("test_node", test_node)
+workflow.add_node("analyze_visible_node", analyze_visible_node)
 workflow.add_node("validate_visible_node", validate_visible_node)
 workflow.add_node("judge_node", judge_node)
 workflow.add_node("validate_judge_node", validate_judge_node)
@@ -142,7 +155,8 @@ workflow.add_conditional_edges(
 workflow.add_edge("compile_node", "validate_compile_node")
 workflow.add_conditional_edges("validate_compile_node", route_after_compile_validation)
 workflow.add_edge("repair_node", "compile_node")
-workflow.add_edge("test_node", "validate_visible_node")
+workflow.add_edge("test_node", "analyze_visible_node")
+workflow.add_edge("analyze_visible_node", "validate_visible_node")
 workflow.add_conditional_edges("validate_visible_node", route_after_visible_validation)
 workflow.add_edge("judge_node", "validate_judge_node")
 workflow.add_conditional_edges("validate_judge_node", route_after_judge_validation)
@@ -193,6 +207,7 @@ async def process_file(
     prompt_id: str = "default",
     prompt_template: str | None = None,
     record_metadata: dict | None = None,
+    run_judge: bool = True,
 ) -> AgentState:
     file_name = os.path.basename(file_path)
     logger.info(f"--- Starting processing for {file_name} ---")
@@ -210,6 +225,7 @@ async def process_file(
         "execution_history": [],
         "test_metrics": {},
         "judge_result": {},
+        "skip_judge": not run_judge,
         "prompt_id": prompt_id,
     }
     if prompt_template is not None:
@@ -242,6 +258,8 @@ async def process_file(
         "failure_category": result.get("failure_category", "infrastructure"),
         "repair_attempts": result.get("repair_count", 0),
         "visible_tests": result.get("test_metrics", {}),
+        "translation_reasoning": result.get("translation_reasoning", ""),
+        "validator_report": result.get("validator_report", {}),
         "judge": judge_result,
         "prompt_id": prompt_id,
         **totals,

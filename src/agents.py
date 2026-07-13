@@ -5,7 +5,7 @@ from typing import List, TypedDict
 
 from mcp import ClientSession
 
-from contracts import JudgeResult, PipelineStatus, ValidationDecision
+from contracts import JudgeResult, PipelineStatus, ValidationDecision, ValidatorReport
 from logger_setup import log_compact_compile, log_compact_judge, log_compact_test
 from validator import (
     validate_compile_result,
@@ -38,6 +38,7 @@ class AgentState(TypedDict, total=False):
     prompt_id: str
     prompt_template: str
     raw_model_output: str
+    translation_reasoning: str
     compile_status: str
     errors: str
     status: PipelineStatus
@@ -45,7 +46,9 @@ class AgentState(TypedDict, total=False):
     failure_category: str
     execution_history: List[StepLog]
     test_metrics: dict
+    validator_report: ValidatorReport
     judge_result: JudgeResult
+    skip_judge: bool
     validation_decision: ValidationDecision
 
 
@@ -90,6 +93,7 @@ class CodeTranslatorAgent:
             prompt_tokens = payload.get("prompt_tokens", 0)
             completion_tokens = payload.get("completion_tokens", 0)
             raw_model_output = payload.get("raw_model_output", rust_code)
+            translation_reasoning = payload.get("translation_reasoning", "")
             errors = payload.get("error", "")
             status = "in_progress" if rust_code and not errors else "failed"
             if not errors and not rust_code:
@@ -102,12 +106,14 @@ class CodeTranslatorAgent:
             status = "failed"
             errors = f"Translation tool execution failed: {exc}"
             raw_model_output = ""
+            translation_reasoning = ""
 
         return {
             "rust_code": rust_code,
             "status": status,
             "errors": errors,
             "raw_model_output": raw_model_output,
+            "translation_reasoning": translation_reasoning,
             "execution_history": _history(
                 state,
                 "translate",
@@ -241,7 +247,55 @@ class CodeValidator:
             state.get("repair_count", 0),
             self.max_repairs,
         )
+        decision = self._add_semantic_guidance(decision, state.get("validator_report", {}))
         return self._state_from_decision(decision)
+
+    async def analyze_test_report(
+        self,
+        state: AgentState,
+        mcp_session: ClientSession,
+    ) -> AgentState:
+        test_report = state.get("test_metrics", {})
+        has_differential_failure = (
+            test_report.get("status") == "failed"
+            and test_report.get("failed_rust_where_c_passed", 0) > 0
+        )
+        if not has_differential_failure:
+            return {
+                "validator_report": {
+                    "status": "not_required",
+                    "semantic_discrepancies": [],
+                }
+            }
+
+        logger.info(f"[{state['file_name']}] Validator: analyzing differential test report")
+        started_at = time.time()
+        try:
+            result = await mcp_session.call_tool(
+                "analyze_translation_discrepancy",
+                arguments={
+                    "c_code": state["c_code"],
+                    "rust_code": state.get("rust_code", ""),
+                    "test_report": test_report,
+                },
+            )
+            response_text = result.content[0].text
+            if result.isError:
+                raise RuntimeError(response_text)
+            validator_report = json.loads(response_text)
+            validator_report["status"] = "completed"
+        except Exception as exc:
+            logger.warning(f"[{state['file_name']}] Validator analysis unavailable: {exc}")
+            validator_report = {
+                "status": "failed",
+                "semantic_discrepancies": [],
+                "error": str(exc),
+            }
+
+        return {
+            "validator_report": validator_report,
+            "execution_history": _history(state, "validator_analysis", started_at),
+        }
 
     def from_judge(self, state: AgentState) -> AgentState:
         decision = validate_judge_result(
@@ -265,6 +319,26 @@ class CodeValidator:
             "failure_category": decision["failure_category"],
             "errors": "" if should_clear_errors else decision["fix_suggestion"],
         }
+
+    @staticmethod
+    def _add_semantic_guidance(
+        decision: ValidationDecision,
+        validator_report: ValidatorReport,
+    ) -> ValidationDecision:
+        if decision["next_action"] != "repair_translation":
+            return decision
+
+        guidance = validator_report.get("repair_guidance", "").strip()
+        if not guidance:
+            return decision
+
+        diagnosis = validator_report.get("diagnosis", "").strip()
+        decision["fix_suggestion"] = (
+            f"{decision['fix_suggestion']}\n\n"
+            f"Semantic diagnosis: {diagnosis}\n"
+            f"Repair guidance: {guidance}"
+        )
+        return decision
 
 
 def _status_after_judge(

@@ -14,7 +14,6 @@ def setup_environment_and_logger(name: str, log_dir: str = "logs") -> logging.Lo
 def configure_log_directory(log_dir: str) -> None:
     """Route pipeline logs to one directory for the lifetime of a run."""
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    Path(log_dir, "runs").mkdir(parents=True, exist_ok=True)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
@@ -104,7 +103,7 @@ def log_compact_judge(
 class RunRecorder:
     def __init__(self, path: str | None = None):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.path = path or os.path.join("logs", "runs", f"{timestamp}.jsonl")
+        self.path = path or os.path.join("logs", f"runs-{timestamp}.jsonl")
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, record: dict):

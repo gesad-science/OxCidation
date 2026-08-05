@@ -17,7 +17,6 @@ class LLMResponse:
     content: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
-    reasoning: str = ""
 
 
 class LLMProvider(Protocol):
@@ -89,7 +88,6 @@ class OpenAICompatibleProvider:
             content=parsed.get("rust_code", ""),
             prompt_tokens=response.prompt_tokens,
             completion_tokens=response.completion_tokens,
-            reasoning=parsed.get("reasoning", ""),
         )
 
 

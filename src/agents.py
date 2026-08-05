@@ -5,7 +5,16 @@ from typing import TYPE_CHECKING, List, TypedDict
 
 from mcp import ClientSession
 
-from contracts import JudgeResult, PipelineStatus, ValidationDecision, ValidatorReport
+from contracts import (
+    AgentInteraction,
+    FailureCategory,
+    JudgeResult,
+    PipelineStatus,
+    TestReport,
+    ValidationDecision,
+    ValidatorReport,
+    VisibleTestSuite,
+)
 from logger_setup import log_compact_compile, log_compact_judge, log_compact_test
 from validator import (
     validate_compile_result,
@@ -25,6 +34,20 @@ CLEAR_ERROR_ACTIONS = {
     "stop_evaluated",
     "skip",
 }
+VALIDATOR_EVIDENCE_FIELDS = (
+    "status",
+    "c_compilation",
+    "rust_compilation",
+    "total_tests",
+    "c_passed",
+    "c_failed",
+    "rust_passed",
+    "rust_failed",
+    "failed_rust_where_c_passed",
+    "verdict_counts",
+    "failure_examples",
+    "baseline_failures",
+)
 
 
 class StepLog(TypedDict):
@@ -42,17 +65,21 @@ class AgentState(TypedDict, total=False):
     prompt_id: str
     prompt_template: str
     raw_model_output: str
-    translation_reasoning: str
     compile_status: str
     errors: str
     status: PipelineStatus
     repair_count: int
-    failure_category: str
+    failure_category: FailureCategory
     execution_history: List[StepLog]
-    test_metrics: dict
+    test_metrics: TestReport
+    visible_test_root: str
+    visible_test_suite: VisibleTestSuite
+    agent_interactions: List[AgentInteraction]
     validator_report: ValidatorReport
     judge_result: JudgeResult
     baseline_judge: dict
+    initial_rust_code: str
+    initial_evaluation: dict
     validation_decision: ValidationDecision
 
 
@@ -71,6 +98,44 @@ def _history(
             "completion_tokens": completion_tokens,
         }
     ]
+
+
+def _interaction(
+    state: AgentState,
+    agent: str,
+    action: str,
+    data: dict,
+    *,
+    repair_count: int | None = None,
+) -> List[AgentInteraction]:
+    interactions = state.get("agent_interactions", [])
+    interaction: AgentInteraction = {
+        "sequence": len(interactions) + 1,
+        "agent": agent,
+        "action": action,
+        "repair_count": (
+            state.get("repair_count", 0) if repair_count is None else repair_count
+        ),
+        "data": data,
+    }
+    if interactions:
+        interaction["caused_by_sequence"] = interactions[-1]["sequence"]
+    return interactions + [interaction]
+
+
+def _latest_interaction_sequence(state: AgentState, action: str) -> int | None:
+    for interaction in reversed(state.get("agent_interactions", [])):
+        if interaction.get("action") == action:
+            return interaction["sequence"]
+    return None
+
+
+def _validator_evidence(test_report: TestReport) -> dict:
+    return {
+        field: test_report[field]
+        for field in VALIDATOR_EVIDENCE_FIELDS
+        if field in test_report
+    }
 
 
 class CodeTranslatorAgent:
@@ -97,7 +162,6 @@ class CodeTranslatorAgent:
             prompt_tokens = payload.get("prompt_tokens", 0)
             completion_tokens = payload.get("completion_tokens", 0)
             raw_model_output = payload.get("raw_model_output", rust_code)
-            translation_reasoning = payload.get("translation_reasoning", "")
             errors = payload.get("error", "")
             status = "in_progress" if rust_code and not errors else "failed"
             if not errors and not rust_code:
@@ -110,14 +174,22 @@ class CodeTranslatorAgent:
             status = "failed"
             errors = f"Translation tool execution failed: {exc}"
             raw_model_output = ""
-            translation_reasoning = ""
 
         return {
             "rust_code": rust_code,
             "status": status,
             "errors": errors,
             "raw_model_output": raw_model_output,
-            "translation_reasoning": translation_reasoning,
+            "agent_interactions": _interaction(
+                state,
+                "translator",
+                "translation",
+                {
+                    "status": status,
+                    "errors": errors,
+                    "rust_code": rust_code,
+                },
+            ),
             "execution_history": _history(
                 state,
                 "translate",
@@ -130,6 +202,7 @@ class CodeTranslatorAgent:
     async def compile(self, state: AgentState) -> AgentState:
         logger.info(f"[{state['file_name']}] Translator: compiling Rust code")
         started_at = time.time()
+        compiler_output = ""
 
         try:
             result = await self.mcp_session.call_tool(
@@ -149,11 +222,18 @@ class CodeTranslatorAgent:
         except Exception as exc:
             status = "failed"
             errors = f"Compilation tool execution failed: {exc}"
+            compiler_output = errors
 
         return {
             "errors": errors,
             "status": status,
             "compile_status": status,
+            "agent_interactions": _interaction(
+                state,
+                "translator",
+                "compilation",
+                {"status": status, "compiler_output": compiler_output},
+            ),
             "execution_history": _history(state, "compile", started_at),
         }
 
@@ -164,16 +244,38 @@ class CodeTranslatorAgent:
         result = await self.mcp_session.call_tool(
             "repair_rust_code",
             arguments={
+                "c_code": state.get("c_code", ""),
                 "rust_code": state.get("rust_code", ""),
                 "errors": state.get("errors", ""),
                 "failure_category": state.get("failure_category", "correctness"),
             },
         )
 
+        repaired_code = result.content[0].text
+        repair_data = {
+            "attempt": attempt,
+            "failure_category": state.get("failure_category", "correctness"),
+            "c_source_ref": "source.c",
+            "rust_code_after": repaired_code,
+        }
+        if state.get("failure_category") == "compile":
+            feedback_sequence = _latest_interaction_sequence(state, "compilation")
+            if feedback_sequence is not None:
+                repair_data["feedback_source_sequence"] = feedback_sequence
+        else:
+            repair_data["feedback"] = state.get("errors", "")
+
         return {
-            "rust_code": result.content[0].text,
+            "rust_code": repaired_code,
             "repair_count": attempt,
             "status": "in_progress",
+            "agent_interactions": _interaction(
+                state,
+                "translator",
+                "repair",
+                repair_data,
+                repair_count=attempt,
+            ),
         }
 
 
@@ -181,19 +283,56 @@ class TesterAgent:
     def __init__(self, mcp_session: ClientSession):
         self.mcp_session = mcp_session
 
+    async def prepare_suite(self, c_code: str, test_root: str) -> VisibleTestSuite:
+        result = await self.mcp_session.call_tool(
+            "generate_visible_test_suite",
+            arguments={"c_code": c_code, "test_root": test_root},
+        )
+        if result.isError:
+            raise RuntimeError(result.content[0].text)
+        return json.loads(result.content[0].text)
+
     async def run_suite(self, state: AgentState) -> AgentState:
-        logger.info(f"[{state['file_name']}] Tester: running visible test suite")
+        logger.info(f"[{state['file_name']}] Tester: preparing visible test suite")
         started_at = time.time()
 
         try:
+            suite, generation_usage = await self._ensure_suite(state)
+            if suite.get("status") != "ready":
+                reason = suite.get("details") or "No valid visible tests were generated."
+                test_report: TestReport = {
+                    "status": "skipped",
+                    "suite_dir": suite.get("suite_dir", ""),
+                    "total_tests": 0,
+                    "failure_category": (
+                        "infrastructure"
+                        if suite.get("status") in {"generation_failed", "baseline_compile_failed"}
+                        else "missing_tests"
+                    ),
+                    "details": reason,
+                }
+                status = "skipped"
+                errors = ""
+                log_compact_test(state["file_name"], status, reason)
+                return self._result(
+                    state,
+                    suite,
+                    test_report,
+                    started_at,
+                    generation_usage=generation_usage,
+                )
+
+            logger.info(f"[{state['file_name']}] Tester: running visible test suite")
             result = await self.mcp_session.call_tool(
                 "evaluate_test_cases",
                 arguments={
-                    "file_name": state["file_name"],
                     "c_code": state["c_code"],
                     "rust_code": state.get("rust_code", ""),
+                    "suite_dir": suite["suite_dir"],
                 },
             )
+            if result.isError:
+                raise RuntimeError(result.content[0].text)
             test_output = json.loads(result.content[0].text)
             status = test_output.get("status", "failed")
             errors = "" if status in ["success", "skipped"] else test_output.get(
@@ -202,16 +341,74 @@ class TesterAgent:
             )
             log_compact_test(state["file_name"], status, errors)
         except Exception as exc:
-            test_output = {}
-            status = "failed"
-            errors = f"Visible test evaluation failed: {exc}"
-            logger.error(f"[{state['file_name']}] {errors}")
+            suite = state.get("visible_test_suite", {})
+            reason = f"Visible test infrastructure failed: {exc}"
+            test_output = {
+                "status": "skipped",
+                "failure_category": "infrastructure",
+                "reason": reason,
+                "details": reason,
+            }
+            status = "skipped"
+            errors = ""
+            generation_usage = (0, 0)
+            logger.error(f"[{state['file_name']}] {reason}")
 
+        return self._result(
+            state,
+            suite,
+            test_output,
+            started_at,
+            status=status,
+            errors=errors,
+            generation_usage=generation_usage,
+        )
+
+    async def _ensure_suite(
+        self,
+        state: AgentState,
+    ) -> tuple[VisibleTestSuite, tuple[int, int]]:
+        existing_suite = state.get("visible_test_suite", {})
+        if existing_suite:
+            return existing_suite, (0, 0)
+
+        suite = await self.prepare_suite(state["c_code"], state["visible_test_root"])
+        usage = (
+            suite.get("prompt_tokens", 0),
+            suite.get("completion_tokens", 0),
+        )
+        return suite, usage
+
+    @staticmethod
+    def _result(
+        state: AgentState,
+        suite: VisibleTestSuite,
+        test_report: TestReport,
+        started_at: float,
+        *,
+        status: str | None = None,
+        errors: str = "",
+        generation_usage: tuple[int, int] = (0, 0),
+    ) -> AgentState:
+        final_status = status or test_report.get("status", "failed")
         return {
-            "status": status,
+            "status": final_status,
             "errors": errors,
-            "test_metrics": test_output,
-            "execution_history": _history(state, "visible_tests", started_at),
+            "test_metrics": test_report,
+            "visible_test_suite": suite,
+            "agent_interactions": _interaction(
+                state,
+                "tester",
+                "visible_test_report",
+                {"test_report": test_report},
+            ),
+            "execution_history": _history(
+                state,
+                "visible_tests",
+                started_at,
+                generation_usage[0],
+                generation_usage[1],
+            ),
         }
 
 
@@ -226,7 +423,7 @@ class CodeValidator:
             state.get("repair_count", 0),
             self.max_repairs,
         )
-        return self._state_from_decision(decision)
+        return self._decision_result(state, decision, "compile_decision")
 
     def from_translation(self, state: AgentState) -> AgentState:
         if state.get("status") == "in_progress" and state.get("rust_code"):
@@ -243,16 +440,31 @@ class CodeValidator:
                 "reason": state.get("errors", "Translation failed."),
                 "fix_suggestion": "",
             }
-        return self._state_from_decision(decision)
+        return self._decision_result(state, decision, "translation_decision")
 
     def from_tests(self, state: AgentState) -> AgentState:
+        validator_report = state.get("validator_report", {})
+        if validator_report.get("test_assessment") == "invalid_visible_test":
+            diagnosis = validator_report.get("diagnosis", "").strip()
+            decision: ValidationDecision = {
+                "next_action": "run_judge",
+                "failure_category": "invalid_tests",
+                "reason": (
+                    f"Validator rejected the visible-test evidence: {diagnosis}"
+                    if diagnosis
+                    else "Validator rejected the visible-test evidence as invalid."
+                ),
+                "fix_suggestion": "",
+            }
+            return self._decision_result(state, decision, "visible_test_decision")
+
         decision = validate_visible_tests(
             state.get("test_metrics", {}),
             state.get("repair_count", 0),
             self.max_repairs,
         )
         decision = self._add_semantic_guidance(decision, state.get("validator_report", {}))
-        return self._state_from_decision(decision)
+        return self._decision_result(state, decision, "visible_test_decision")
 
     async def analyze_test_report(
         self,
@@ -265,11 +477,18 @@ class CodeValidator:
             and test_report.get("failed_rust_where_c_passed", 0) > 0
         )
         if not has_differential_failure:
+            validator_report = {
+                "status": "not_required",
+                "semantic_discrepancies": [],
+            }
             return {
-                "validator_report": {
-                    "status": "not_required",
-                    "semantic_discrepancies": [],
-                }
+                "validator_report": validator_report,
+                "agent_interactions": _interaction(
+                    state,
+                    "validator",
+                    "semantic_analysis_skipped",
+                    {"reason": "No differential visible-test failure required analysis."},
+                ),
             }
 
         logger.info(f"[{state['file_name']}] Validator: analyzing differential test report")
@@ -280,7 +499,7 @@ class CodeValidator:
                 arguments={
                     "c_code": state["c_code"],
                     "rust_code": state.get("rust_code", ""),
-                    "test_report": test_report,
+                    "test_report": _validator_evidence(test_report),
                 },
             )
             response_text = result.content[0].text
@@ -298,6 +517,12 @@ class CodeValidator:
 
         return {
             "validator_report": validator_report,
+            "agent_interactions": _interaction(
+                state,
+                "validator",
+                "semantic_analysis",
+                {"validator_report": validator_report},
+            ),
             "execution_history": _history(state, "validator_analysis", started_at),
         }
 
@@ -305,12 +530,32 @@ class CodeValidator:
         decision = validate_judge_result(
             state.get("judge_result", {}),
         )
-        next_state = self._state_from_decision(decision)
+        next_state = self._decision_result(state, decision, "judge_decision")
         next_state["status"] = _status_after_judge(
             state.get("status", "success"),
             decision,
         )
         return next_state
+
+    def _decision_result(
+        self,
+        state: AgentState,
+        decision: ValidationDecision,
+        action: str,
+    ) -> AgentState:
+        result = self._state_from_decision(decision)
+        result["agent_interactions"] = _interaction(
+            state,
+            "validator",
+            action,
+            {
+                "decision": {
+                    key: decision[key]
+                    for key in ("next_action", "failure_category", "reason")
+                }
+            },
+        )
+        return result
 
     def _state_from_decision(
         self,
@@ -332,13 +577,17 @@ class CodeValidator:
         if decision["next_action"] != "repair_translation":
             return decision
 
+        if validator_report.get("test_assessment") == "invalid_visible_test":
+            return decision
+
         guidance = validator_report.get("repair_guidance", "").strip()
         if not guidance:
             return decision
 
         diagnosis = validator_report.get("diagnosis", "").strip()
         decision["fix_suggestion"] = (
-            f"{decision['fix_suggestion']}\n\n"
+            f"Failure category: {decision['failure_category']}. "
+            "Repair the Rust translation without changing the C program's behavior.\n"
             f"Semantic diagnosis: {diagnosis}\n"
             f"Repair guidance: {guidance}"
         )
@@ -361,13 +610,62 @@ class CodeEvaluator:
     ):
         self.judge_comparison = judge_comparison
 
-    async def evaluate(self, state: AgentState) -> AgentState:
-        logger.info(f"[{state['file_name']}] Evaluator: running judge validation")
-        started_at = time.time()
+    async def evaluate_initial(self, state: AgentState) -> AgentState:
+        if state.get("initial_evaluation"):
+            return {}
 
+        logger.info(f"[{state['file_name']}] Evaluator: evaluating initial translation")
+        started_at = time.time()
+        comparison, judge_result = self._run_comparison(state)
+        self._log_result(state, judge_result)
+
+        return {
+            "initial_rust_code": state.get("rust_code", ""),
+            "initial_evaluation": comparison,
+            "agent_interactions": _interaction(
+                state,
+                "evaluator",
+                "initial_judge_evaluation",
+                {"judge_result": self._judge_summary(judge_result)},
+            ),
+            "execution_history": _history(state, "initial_judge", started_at),
+        }
+
+    async def evaluate(self, state: AgentState) -> AgentState:
+        logger.info(f"[{state['file_name']}] Evaluator: running final judge evaluation")
+        started_at = time.time()
+        reused_initial = (
+            bool(state.get("initial_evaluation"))
+            and state.get("initial_rust_code") == state.get("rust_code", "")
+        )
+        if reused_initial:
+            baseline_judge = state["initial_evaluation"]
+            judge_result = baseline_judge["rust"]["judge"]
+        else:
+            baseline_judge, judge_result = self._run_comparison(state)
+            self._log_result(state, judge_result)
+
+        return {
+            "status": state.get("status", "success"),
+            "errors": "",
+            "judge_result": judge_result,
+            "baseline_judge": baseline_judge,
+            "agent_interactions": _interaction(
+                state,
+                "evaluator",
+                "judge_evaluation",
+                {
+                    "judge_result": self._judge_summary(judge_result),
+                    "reused_initial_evaluation": reused_initial,
+                },
+            ),
+            "execution_history": _history(state, "judge", started_at),
+        }
+
+    def _run_comparison(self, state: AgentState) -> tuple[dict, JudgeResult]:
         try:
             if self.judge_comparison is None:
-                baseline_judge = {
+                comparison = {
                     "baseline_status": "not_configured",
                     "c": {},
                     "rust": {
@@ -378,29 +676,15 @@ class CodeEvaluator:
                     },
                 }
             else:
-                baseline_judge = self.judge_comparison.evaluate(
+                comparison = self.judge_comparison.evaluate(
                     state["file_name"].removesuffix(".c"),
                     state["problem_id"],
                     state["c_code"],
                     state.get("rust_code", ""),
                 )
-
-            judge_result = baseline_judge["rust"]["judge"]
-            judge_status = judge_result.get("status", "INFRA_ERROR")
-            errors = ""
-            log_compact_judge(
-                state["file_name"],
-                judge_status,
-                judge_result.get("details", ""),
-                judge_result.get("verdict_counts", {}),
-            )
+            return comparison, comparison["rust"]["judge"]
         except Exception as exc:
-            baseline_judge = {
-                "baseline_status": "infrastructure_error",
-                "c": {},
-                "rust": {},
-            }
-            judge_result = {
+            judge_result: JudgeResult = {
                 "status": "INFRA_ERROR",
                 "passed": 0,
                 "failed": 0,
@@ -408,14 +692,34 @@ class CodeEvaluator:
                 "time_ms": 0,
                 "details": f"Judge evaluation failed: {exc}",
             }
-            judge_status = "INFRA_ERROR"
-            errors = ""
             logger.error(f"[{state['file_name']}] {judge_result['details']}")
+            return {
+                "baseline_status": "infrastructure_error",
+                "c": {},
+                "rust": {"judge": judge_result},
+            }, judge_result
 
+    @staticmethod
+    def _judge_summary(judge_result: JudgeResult) -> dict:
         return {
-            "status": state.get("status", "success"),
-            "errors": errors,
-            "judge_result": judge_result,
-            "baseline_judge": baseline_judge,
-            "execution_history": _history(state, "judge", started_at),
+            key: judge_result.get(key)
+            for key in (
+                "status",
+                "passed",
+                "failed",
+                "total",
+                "time_ms",
+                "details",
+                "verdict_counts",
+                "first_failure",
+            )
         }
+
+    @staticmethod
+    def _log_result(state: AgentState, judge_result: JudgeResult) -> None:
+        log_compact_judge(
+            state["file_name"],
+            judge_result.get("status", "INFRA_ERROR"),
+            judge_result.get("details", ""),
+            judge_result.get("verdict_counts", {}),
+        )

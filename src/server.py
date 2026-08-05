@@ -4,9 +4,9 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import tempfile
+from typing import Literal
 
 from dotenv import load_dotenv
 from langchain_core.output_parsers import JsonOutputParser
@@ -16,8 +16,15 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 from config import ConfigDetails
-from judge_execution import compile_c, compile_rust, list_input_cases
+from judge_execution import compile_rust
 from rate_limit import RequestRateLimiter
+from visible_testing import (
+    evaluate_visible_suite,
+    find_reusable_suite,
+    load_generation_prompt,
+    materialize_generated_suite,
+    record_generation_failure,
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -34,17 +41,38 @@ request_rate_limiter = RequestRateLimiter(configs.request_rate_limit_rpm)
 
 
 class TranslationResult(BaseModel):
-    reasoning: str = Field(
-        description="A concise translation rationale without hidden chain-of-thought."
-    )
     rust_code: str = Field(description="Raw Rust code without markdown backticks.")
 
 
 class SemanticValidationResult(BaseModel):
+    test_assessment: Literal["translation_discrepancy", "invalid_visible_test"] = Field(
+        description=(
+            "Whether the evidence demonstrates a Rust translation discrepancy or an "
+            "invalid, incomplete, or unreliable visible test."
+        )
+    )
     diagnosis: str = Field(description="Concise diagnosis of the differential test failure.")
-    repair_guidance: str = Field(description="Concrete repair guidance for the Rust translation.")
+    repair_guidance: str = Field(
+        description=(
+            "Concrete repair guidance for a translation_discrepancy; empty for an "
+            "invalid_visible_test."
+        )
+    )
     semantic_discrepancies: list[str] = Field(
         description="Likely semantic discrepancies supported by the test report."
+    )
+
+
+class GeneratedVisibleTestCase(BaseModel):
+    purpose: str = Field(description="The observable behavior or path exercised by this case.")
+    input: str = Field(description="Complete text to send to the program's standard input.")
+
+
+class GeneratedVisibleTestSuite(BaseModel):
+    strategy: str = Field(description="A concise summary of the behaviors covered by the suite.")
+    cases: list[GeneratedVisibleTestCase] = Field(
+        min_length=1,
+        description="Concrete standard-input cases. Choose the necessary number of cases.",
     )
 
 
@@ -108,11 +136,7 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
     if prompt_template is None:
         with open("prompts/direct_translation_prompt.txt", encoding="utf-8") as prompt_file:
             prompt_template = prompt_file.read()
-    prompt = (
-        f"{prompt_template.replace('{c_code}', c_code)}\n\n"
-        "For the structured response, include a concise translation rationale that lists "
-        "the important behavior-preserving choices. Do not provide hidden chain-of-thought."
-    )
+    prompt = prompt_template.replace("{c_code}", c_code)
     llm = get_llm()
     try:
         response = invoke_llm(
@@ -125,7 +149,6 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "raw_model_output": response.rust_code,
-                "translation_reasoning": response.reasoning,
             }
         )
     except Exception as strict_error:
@@ -144,7 +167,6 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
                     "raw_model_output": response.content,
-                    "translation_reasoning": payload.get("reasoning", ""),
                 }
             )
         except Exception as fallback_error:
@@ -154,18 +176,24 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "raw_model_output": "",
-                    "translation_reasoning": "",
                     "error": f"LLM parsing failed completely: {fallback_error}",
                 }
             )
 
 
 @mcp.tool()
-def repair_rust_code(rust_code: str, errors: str, failure_category: str = "correctness") -> str:
+def repair_rust_code(
+    c_code: str,
+    rust_code: str,
+    errors: str,
+    failure_category: str = "correctness",
+) -> str:
     """Repairs Rust code from a compiler or visible-test report."""
     prompt = (
-        "You are an expert Rust developer. Fix this Rust code.\n"
-        f"Failure category: {failure_category}\n\nCode:\n{rust_code}\n\n"
+        "You are an expert C-to-Rust translator. Repair the Rust translation while "
+        "preserving the C program's behavior and intended algorithm.\n"
+        f"Failure category: {failure_category}\n\nC source:\n{c_code}\n\n"
+        f"Current Rust translation:\n{rust_code}\n\n"
         f"Issues:\n{errors}\n\nReturn ONLY fixed Rust code without markdown."
     )
     try:
@@ -181,7 +209,12 @@ def analyze_translation_discrepancy(c_code: str, rust_code: str, test_report: di
     prompt = (
         "You are a code validation specialist for behavior-preserving C to Rust translation.\n"
         "Analyze the C source, Rust translation, and differential visible-test report. "
-        "Identify only supported discrepancies and give concise repair guidance. "
+        "First verify that the failing inputs are complete and valid for every input operation "
+        "performed by the C source. If an input is malformed, incomplete, or makes the C oracle "
+        "depend on undefined or uninitialized data, classify it as invalid_visible_test and do "
+        "not recommend changing Rust to accept it. Otherwise classify it as "
+        "translation_discrepancy and provide concise behavior-preserving repair guidance. "
+        "Identify only supported discrepancies. "
         "Do not reveal hidden chain-of-thought.\n\n"
         f"C source:\n{c_code}\n\nRust translation:\n{rust_code}\n\n"
         f"Differential test report:\n{json.dumps(test_report, ensure_ascii=False)}"
@@ -204,76 +237,77 @@ def analyze_translation_discrepancy(c_code: str, rust_code: str, test_report: di
 
 
 @mcp.tool()
-def evaluate_test_cases(file_name: str, c_code: str, rust_code: str) -> str:
-    """Runs the local visible I/O suite for C and Rust."""
-    test_dir = os.path.join("data/processed/tests", file_name.removesuffix(".c"))
-    if not os.path.isdir(test_dir):
-        return json.dumps({"status": "skipped", "reason": f"No tests found for {file_name} in {test_dir}"})
-    input_cases = list_input_cases(test_dir)
-    if not input_cases:
-        return json.dumps({"status": "skipped", "reason": f"No .in files found in {test_dir}"})
+def generate_visible_test_suite(c_code: str, test_root: str) -> str:
+    """Generates language-agnostic inputs and materializes C oracle outputs."""
+    prompt_template = load_generation_prompt()
+    existing_suite = find_reusable_suite(test_root, c_code, prompt_template)
+    if existing_suite is not None:
+        return json.dumps(existing_suite, ensure_ascii=False)
 
-    report = {
-        "status": "success",
-        "c_compilation": "success",
-        "rust_compilation": "success",
-        "total_tests": len(input_cases),
-        "c_passed": 0,
-        "c_failed": 0,
-        "rust_passed": 0,
-        "rust_failed": 0,
-        "failed_rust_where_c_passed": 0,
-        "passed_rust_where_c_failed": 0,
-        "failed_tests": [],
-        "details": "",
-    }
-    with tempfile.TemporaryDirectory() as temp_dir:
-        c_compile, c_binary = compile_c(c_code, temp_dir)
-        if c_compile.returncode != 0:
-            report.update(status="c_failed_compilation", c_compilation="failed", details=c_compile.stderr)
-            return json.dumps(report)
-        rust_compile, rust_binary = compile_rust(rust_code, temp_dir)
-        if rust_compile.returncode != 0:
-            report.update(status="failed", rust_compilation="failed", details=rust_compile.stderr)
-            return json.dumps(report)
-
-        for input_name in input_cases:
-            input_path = os.path.join(test_dir, input_name)
-            output_path = os.path.join(test_dir, input_name.replace(".in", ".out"))
-            with open(input_path, encoding="utf-8") as input_file:
-                input_data = input_file.read()
-            expected_output = ""
-            if os.path.exists(output_path):
-                with open(output_path, encoding="utf-8") as output_file:
-                    expected_output = output_file.read()
-            c_output = run_visible_program(c_binary, input_data)
-            rust_output = run_visible_program(rust_binary, input_data)
-            c_passed = c_output.split() == expected_output.split()
-            rust_passed = rust_output.split() == expected_output.split()
-            report["c_passed" if c_passed else "c_failed"] += 1
-            report["rust_passed" if rust_passed else "rust_failed"] += 1
-            if c_passed and not rust_passed:
-                report["status"] = "failed"
-                report["failed_tests"].append(input_name)
-                report["failed_rust_where_c_passed"] += 1
-                report["details"] += (
-                    f"Test {input_name} failed.\nExpected (first 10 lines):\n"
-                    f"{' '.join(expected_output.splitlines()[:10])}\n\nRust Output (first 10 lines):\n"
-                    f"{' '.join(rust_output.splitlines()[:10])}\n\n"
-                )
-            elif rust_passed and not c_passed:
-                report["passed_rust_where_c_failed"] += 1
-    return json.dumps(report)
-
-
-def run_visible_program(command: str, input_data: str) -> str:
+    prompt = prompt_template.replace("{c_code}", c_code)
     try:
-        return subprocess.run(
-            [command], input=input_data, capture_output=True, text=True,
-            timeout=configs.visible_test_time_limit_sec,
-        ).stdout
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT"
+        llm = get_llm()
+    except Exception as error:
+        suite = record_generation_failure(
+            c_code,
+            test_root,
+            prompt_template,
+            f"Visible-test model initialization failed: {error}",
+        )
+        return json.dumps(suite, ensure_ascii=False)
+
+    try:
+        response = invoke_llm(
+            llm.with_structured_output(
+                GeneratedVisibleTestSuite,
+                method="json_schema",
+                strict=True,
+            ),
+            prompt,
+        )
+        generation = response.model_dump()
+        usage = {}
+    except Exception as strict_error:
+        logger.warning("Structured visible-test generation failed: %s", strict_error)
+        try:
+            parser = JsonOutputParser(pydantic_object=GeneratedVisibleTestSuite)
+            response = invoke_llm(
+                llm.bind(response_format={"type": "json_object"}),
+                f"{parser.get_format_instructions()}\n\n{prompt}",
+            )
+            generation = parser.invoke(response.content)
+            usage = response.usage_metadata or {}
+        except Exception as fallback_error:
+            suite = record_generation_failure(
+                c_code,
+                test_root,
+                prompt_template,
+                f"Visible-test generation failed: {fallback_error}",
+            )
+            return json.dumps(suite, ensure_ascii=False)
+
+    suite = materialize_generated_suite(
+        c_code,
+        generation,
+        test_root,
+        configs.visible_test_time_limit_sec,
+        prompt_template,
+        usage.get("input_tokens", 0),
+        usage.get("output_tokens", 0),
+    )
+    return json.dumps(suite, ensure_ascii=False)
+
+
+@mcp.tool()
+def evaluate_test_cases(c_code: str, rust_code: str, suite_dir: str) -> str:
+    """Executes C and Rust against one language-agnostic visible-test suite."""
+    report = evaluate_visible_suite(
+        c_code,
+        rust_code,
+        suite_dir,
+        configs.visible_test_time_limit_sec,
+    )
+    return json.dumps(report, ensure_ascii=False)
 
 
 if __name__ == "__main__":

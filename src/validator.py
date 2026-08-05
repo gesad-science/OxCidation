@@ -1,3 +1,5 @@
+import json
+
 from contracts import FailureCategory, JudgeResult, ValidationDecision
 
 JUDGE_FAILURE_CATEGORIES: dict[str, FailureCategory] = {
@@ -15,11 +17,13 @@ def _repair_or_stop(
     max_repairs: int,
     failure_category: FailureCategory,
     reason: str,
+    repair_feedback: str | None = None,
 ) -> ValidationDecision:
+    repair_feedback = repair_feedback or reason
     fix_suggestion = (
         f"Failure category: {failure_category}. "
-        f"Use the report below to repair the translated Rust code without changing the intended algorithm.\n"
-        f"{reason}"
+        "Repair the Rust translation without changing the C program's behavior.\n"
+        f"{repair_feedback}"
     )
     if repair_count >= max_repairs:
         return {
@@ -51,8 +55,14 @@ def validate_compile_result(
             "fix_suggestion": "",
         }
 
-    reason = errors or "Rust compilation failed."
-    return _repair_or_stop(repair_count, max_repairs, "compile", reason)
+    compiler_output = errors or "No compiler diagnostics were returned."
+    return _repair_or_stop(
+        repair_count,
+        max_repairs,
+        "compile",
+        "Rust compilation failed.",
+        compiler_output,
+    )
 
 
 def validate_visible_tests(
@@ -73,7 +83,7 @@ def validate_visible_tests(
     if status == "skipped":
         return {
             "next_action": "run_judge",
-            "failure_category": "missing_tests",
+            "failure_category": test_result.get("failure_category", "missing_tests"),
             "reason": test_result.get("reason", "Visible tests were skipped."),
             "fix_suggestion": "",
         }
@@ -87,18 +97,47 @@ def validate_visible_tests(
         }
 
     category = _visible_failure_category(status, test_result)
-    reason = test_result.get("details") or "Visible tests failed."
-    return _repair_or_stop(repair_count, max_repairs, category, reason)
+    reason = _visible_summary(test_result)
+    return _repair_or_stop(
+        repair_count,
+        max_repairs,
+        category,
+        reason,
+        _visible_repair_evidence(test_result),
+    )
+
+
+def _visible_summary(test_result: dict) -> str:
+    verdicts = ", ".join(
+        f"{verdict}={count}"
+        for verdict, count in test_result.get("verdict_counts", {}).items()
+        if count
+    )
+    summary = (
+        f"Visible tests failed: {test_result.get('failed_rust_where_c_passed', 0)} "
+        f"of {test_result.get('total_tests', 0)} cases failed where C passed."
+    )
+    return f"{summary} Verdicts: {verdicts}." if verdicts else summary
+
+
+def _visible_repair_evidence(test_result: dict) -> str:
+    evidence = _visible_summary(test_result)
+    examples = test_result.get("failure_examples", [])
+    if examples:
+        evidence += "\nFailure examples:\n" + json.dumps(examples, ensure_ascii=False)
+    return evidence
 
 
 def _visible_failure_category(status: str, test_result: dict) -> FailureCategory:
     if test_result.get("rust_compilation") == "failed":
         return "compile"
 
-    return {
-        "TIME_LIMIT_EXCEEDED": "timeout",
-        "RUNTIME_ERROR": "runtime",
-    }.get(status, "correctness")
+    verdict_counts = test_result.get("verdict_counts", {})
+    if verdict_counts.get("TIME_LIMIT_EXCEEDED", 0):
+        return "timeout"
+    if verdict_counts.get("RUNTIME_ERROR", 0):
+        return "runtime"
+    return "correctness"
 
 
 def validate_judge_result(

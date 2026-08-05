@@ -28,7 +28,13 @@ FailureCategory = Literal[
     "timeout",
     "memory",
     "missing_tests",
+    "invalid_tests",
     "infrastructure",
+]
+
+TestAssessment = Literal[
+    "translation_discrepancy",
+    "invalid_visible_test",
 ]
 
 NextAction = Literal[
@@ -51,7 +57,6 @@ class TranslationRequest(TypedDict, total=False):
 
 class TranslationResult(TypedDict, total=False):
     rust_code: str
-    translation_reasoning: str
     status: PipelineStatus
     errors: str
     prompt_tokens: int
@@ -60,15 +65,60 @@ class TranslationResult(TypedDict, total=False):
 
 class ValidatorReport(TypedDict, total=False):
     status: str
+    test_assessment: TestAssessment
     diagnosis: str
     repair_guidance: str
     semantic_discrepancies: list[str]
     error: str
 
 
+class VisibleTestSuite(TypedDict, total=False):
+    status: str
+    source: str
+    source_sha256: str
+    prompt_sha256: str
+    strategy: str
+    candidate_count: int
+    case_count: int
+    suite_dir: str
+    reused: bool
+    prompt_tokens: int
+    completion_tokens: int
+    details: str
+
+
+class TestReport(TypedDict, total=False):
+    status: PipelineStatus
+    failure_category: FailureCategory
+    suite_dir: str
+    c_compilation: str
+    rust_compilation: str
+    total_tests: int
+    c_passed: int
+    c_failed: int
+    rust_passed: int
+    rust_failed: int
+    failed_rust_where_c_passed: int
+    failed_tests: list[str]
+    verdict_counts: dict[str, int]
+    failure_examples: list[dict]
+    baseline_failures: list[dict]
+    details: str
+
+
+class AgentInteraction(TypedDict, total=False):
+    sequence: int
+    agent: str
+    action: str
+    repair_count: int
+    caused_by_sequence: int
+    data: dict
+
+
 class RepairRequest(TypedDict):
+    c_code: str
     rust_code: str
-    failure_report: str
+    feedback: str
     failure_category: FailureCategory
     attempt_number: int
 

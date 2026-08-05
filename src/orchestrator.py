@@ -86,7 +86,14 @@ async def compile_node(
     state: AgentState,
     config: RunnableConfig,
 ) -> AgentState:
-    return await CodeTranslatorAgent(_mcp_session(config)).compile(state)
+    compile_result = await CodeTranslatorAgent(_mcp_session(config)).compile(
+        state
+    )
+    compiled_state = {**state, **compile_result}
+    initial_evaluation = await CodeEvaluator(
+        _judge_comparison(config)
+    ).evaluate_initial(compiled_state)
+    return {**compile_result, **initial_evaluation}
 
 
 async def validate_translation_node(state: AgentState) -> AgentState:
@@ -211,6 +218,8 @@ async def process_file(
     record_metadata: dict | None = None,
     problem_id: str = "",
     judge_comparison=None,
+    visible_tests_root: str = "data/processed/tests",
+    visible_test_suite: dict | None = None,
 ) -> AgentState:
     file_name = os.path.basename(file_path)
     logger.info(f"--- Starting processing for {file_name} ---")
@@ -227,10 +236,18 @@ async def process_file(
         "repair_count": 0,
         "failure_category": "none",
         "execution_history": [],
+        "agent_interactions": [],
         "test_metrics": {},
         "judge_result": {},
+        "initial_evaluation": {},
         "prompt_id": prompt_id,
+        "visible_test_root": os.path.join(
+            visible_tests_root,
+            file_name.removesuffix(".c"),
+        ),
     }
+    if visible_test_suite is not None:
+        initial_state["visible_test_suite"] = visible_test_suite
     if prompt_template is not None:
         initial_state["prompt_template"] = prompt_template
 
@@ -266,9 +283,11 @@ async def process_file(
         "failure_category": result.get("failure_category", "infrastructure"),
         "repair_attempts": result.get("repair_count", 0),
         "visible_tests": result.get("test_metrics", {}),
-        "translation_reasoning": result.get("translation_reasoning", ""),
+        "visible_test_suite": result.get("visible_test_suite", {}),
+        "agent_interactions": result.get("agent_interactions", []),
         "validator_report": result.get("validator_report", {}),
         "baseline_judge": result.get("baseline_judge", {}),
+        "initial_evaluation": result.get("initial_evaluation", {}),
         "judge": judge_result,
         "prompt_id": prompt_id,
         **totals,

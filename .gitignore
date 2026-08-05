@@ -145,6 +145,7 @@ venv.bak/
 extra-progress/
 */session.txt
 session.txt
+data/processed/aoj_system_tests/
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -182,6 +183,7 @@ pyrightconfig.json
 *.pdf
 *.csv
 *.txt
+!requirements.txt
 
 logs/
 outputs/
@@ -196,3 +198,4 @@ data/processed/benchmark_population*.summary.json
 !prompts/
 !prompts/benchmark/
 !prompts/benchmark/*.txt
+!prompts/visible_test_generation_prompt.txt

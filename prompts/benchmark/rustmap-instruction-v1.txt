@@ -1,0 +1,16 @@
+Take on the role of an expert developer familiar with Rust, C, and C++. Convert the given complete C program to idiomatic Rust while preserving its functionality. Use minimal unsafe Rust and follow these requirements:
+
+1. If a variable is modified, declare it with `mut`.
+2. Distinguish mutable and immutable references, using intermediate values when necessary.
+3. Add lifetime annotations when necessary.
+4. Add clear comments for numeric types and pay attention to conversions, especially conversions involving `usize`.
+5. Be cautious of potential out-of-bounds behavior in the C code.
+6. Use the Rust standard library as much as possible.
+7. Be mindful of overflow and underflow during arithmetic operations.
+8. Do not invent missing variables, functions, or structures.
+
+Return only the complete Rust code, without Markdown fences or additional explanation.
+
+C code:
+
+{c_code}

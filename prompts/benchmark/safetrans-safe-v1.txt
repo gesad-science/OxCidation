@@ -1,0 +1,13 @@
+Given the following code written in C, translate it into equivalent Rust code that solves exactly the same problem as the original code.
+
+Ensure the following:
+
+- Produce only safe Rust code.
+- Produce a complete program that can be compiled and executed with all necessary imports.
+- Output only code, without additional explanations or comments.
+
+C code:
+
+{c_code}
+
+Rust code:

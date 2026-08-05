@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -6,11 +7,15 @@ from pathlib import Path
 from benchmark import (
     Prompt,
     SourceProgram,
-    build_csv_row,
-    create_experiment_dir,
     load_sources,
     select_sources,
     server_environment,
+)
+from benchmark_reporting import (
+    build_result_row,
+    extract_attempts,
+    summarize,
+    write_artifacts,
 )
 
 
@@ -38,6 +43,53 @@ class BenchmarkSelectionTests(unittest.TestCase):
 
 
 class BenchmarkCsvTests(unittest.TestCase):
+    def test_attempt_keeps_initial_and_final_judge_results_separate(self):
+        result = {
+            "repair_count": 0,
+            "agent_interactions": [
+                {
+                    "sequence": 1,
+                    "action": "translation",
+                    "repair_count": 0,
+                    "data": {
+                        "status": "in_progress",
+                        "rust_code": "fn main() {}",
+                    },
+                },
+                {
+                    "sequence": 2,
+                    "action": "initial_judge_evaluation",
+                    "repair_count": 0,
+                    "data": {
+                        "judge_result": {
+                            "status": "WRONG_ANSWER",
+                            "total": 2,
+                            "passed": 1,
+                            "failed": 1,
+                        }
+                    },
+                },
+                {
+                    "sequence": 3,
+                    "action": "judge_evaluation",
+                    "repair_count": 0,
+                    "data": {
+                        "judge_result": {
+                            "status": "WRONG_ANSWER",
+                            "total": 2,
+                            "passed": 1,
+                            "failed": 1,
+                        }
+                    },
+                },
+            ],
+        }
+
+        attempt = extract_attempts(result)[0]
+
+        self.assertEqual(attempt["initial_judge_status"], "WRONG_ANSWER")
+        self.assertEqual(attempt["final_judge_status"], "WRONG_ANSWER")
+
     def test_row_includes_each_judge_verdict_count(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -49,13 +101,40 @@ class BenchmarkCsvTests(unittest.TestCase):
                 "status": "success",
                 "compile_status": "success",
                 "test_metrics": {"status": "success", "total_tests": 2, "rust_passed": 2},
+                "visible_test_suite": {
+                    "status": "ready",
+                    "source": "generated",
+                    "candidate_count": 3,
+                    "case_count": 2,
+                    "suite_dir": str(root / "visible_tests" / "s1" / "hash"),
+                },
                 "judge_result": {"status": "WRONG_ANSWER", "total": 3, "passed": 2, "failed": 1, "verdict_counts": {"WRONG_ANSWER": 1}},
                 "execution_history": [],
-                "translation_reasoning": "Preserved the loop bounds.",
                 "validator_report": {"status": "not_required"},
+                "agent_interactions": [
+                    {
+                        "sequence": 1,
+                        "agent": "validator",
+                        "action": "semantic_analysis",
+                        "repair_count": 0,
+                        "data": {
+                            "validator_report": {
+                                "status": "completed",
+                                "test_assessment": "invalid_visible_test",
+                            }
+                        },
+                    },
+                    {
+                        "sequence": 2,
+                        "agent": "validator",
+                        "action": "semantic_analysis",
+                        "repair_count": 1,
+                        "data": {"validator_report": {"status": "not_required"}},
+                    },
+                ],
             }
 
-            row = build_csv_row(
+            row = build_result_row(
                 "experiment",
                 source,
                 prompt,
@@ -63,23 +142,32 @@ class BenchmarkCsvTests(unittest.TestCase):
                 result,
                 artifact_dir,
                 root,
+                1,
+                1,
             )
 
             self.assertEqual(row["judge_wrong_answer_count"], 1)
             self.assertEqual(row["judge_accepted_count"], 0)
-            self.assertTrue(row["translation_reasoning_path"].endswith("translation_reasoning.txt"))
+            self.assertEqual(row["visible_suite_cases"], 2)
+            self.assertEqual(row["visible_suite_path"], "visible_tests/s1/hash")
+            self.assertEqual(row["validator_completed_analysis_count"], 1)
+            self.assertEqual(row["validator_invalid_visible_test_count"], 1)
+            summary = summarize([row])["by_prompt"]["direct"]
+            self.assertEqual(summary["validator_completed_analyses"], 1)
+            self.assertEqual(summary["validator_invalid_visible_tests"], 1)
+
+            source.path.write_text("int main() {}", encoding="utf-8")
+            write_artifacts(artifact_dir, source, result)
+            interactions = json.loads(
+                (artifact_dir / "agent_interactions.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                interactions[0]["data"]["validator_report"]["status"],
+                "completed",
+            )
 
 
 class BenchmarkProcessTests(unittest.TestCase):
-    def test_reuses_an_empty_experiment_directory(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            (root / "retry").mkdir()
-
-            experiment_dir = create_experiment_dir(root, "retry")
-
-            self.assertEqual(experiment_dir, root / "retry")
-
     def test_server_inherits_the_resolved_config_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "gemini.yaml"

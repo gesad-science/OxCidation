@@ -1,0 +1,17 @@
+# Preamble
+
+You are given a C program. We need to translate it to Rust.
+
+# Code to be translated
+
+{c_code}
+
+# Instruction
+
+Give a Rust translation of the C code.
+
+# Constraints
+
+- Return only the translated code, without explanations or other text.
+- Use only safe Rust.
+- Do not use custom generics.

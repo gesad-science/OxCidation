@@ -40,7 +40,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def artifact_directory(experiment_dir: Path, row: dict) -> Path:
-    translated_path = row.get("translated_code_path", "")
+    translated_path = row.get("final_code_path") or row.get(
+        "translated_code_path", ""
+    )
     if translated_path:
         return (experiment_dir / translated_path).parent
     return experiment_dir / "model_outputs" / row["snippet_id"] / row["prompt_id"]

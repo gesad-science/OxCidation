@@ -43,10 +43,23 @@ RESULT_FIELDS = (
     "visible_suite_source",
     "visible_suite_candidates",
     "visible_suite_cases",
+    "visible_suite_review_status",
+    "visible_suite_c_compile_profile",
+    "visible_suite_generation_attempts",
+    "visible_suite_generated_candidates",
+    "visible_suite_rejected_candidates",
+    "visible_suite_invalid_cases",
+    "visible_suite_inconclusive_cases",
+    "visible_suite_unresolved_replacements",
+    "visible_suite_sha256",
+    "visible_suite_details",
     "visible_suite_reused",
     "visible_suite_path",
+    "visible_suite_preparation_history_path",
     "visible_generation_prompt_tokens",
     "visible_generation_completion_tokens",
+    "visible_review_prompt_tokens",
+    "visible_review_completion_tokens",
     "visible_cases_total",
     "visible_cases_passed",
     "baseline_status",
@@ -72,6 +85,7 @@ RESULT_FIELDS = (
     "attempts_path",
     "validator_completed_analysis_count",
     "validator_invalid_visible_test_count",
+    "validator_inconclusive_count",
     "result_path",
 ) + tuple(f"judge_{verdict.lower()}_count" for verdict in VERDICTS)
 
@@ -142,7 +156,10 @@ def extract_attempts(result: dict) -> list[dict]:
 
         if action == "translation":
             current["rust_code"] = data.get("rust_code", "")
-            current["translation_status"] = data.get("status", "")
+            translation_status = data.get("status", "")
+            if translation_status == "in_progress" and current["rust_code"]:
+                translation_status = "success"
+            current["translation_status"] = translation_status
         elif action == "repair":
             current["rust_code"] = data.get("rust_code_after", "")
             current["repair_failure_category"] = data.get("failure_category", "")
@@ -291,9 +308,35 @@ def build_result_row(
         "visible_suite_source": visible_suite.get("source", ""),
         "visible_suite_candidates": visible_suite.get("candidate_count", 0),
         "visible_suite_cases": visible_suite.get("case_count", 0),
+        "visible_suite_review_status": visible_suite.get("review_status", ""),
+        "visible_suite_c_compile_profile": visible_suite.get(
+            "c_compile_profile", ""
+        ),
+        "visible_suite_generation_attempts": visible_suite.get(
+            "generation_attempt_count", 0
+        ),
+        "visible_suite_generated_candidates": visible_suite.get(
+            "generated_candidate_count", 0
+        ),
+        "visible_suite_rejected_candidates": visible_suite.get(
+            "rejected_candidate_count", 0
+        ),
+        "visible_suite_invalid_cases": visible_suite.get("invalid_case_count", 0),
+        "visible_suite_inconclusive_cases": visible_suite.get(
+            "inconclusive_case_count", 0
+        ),
+        "visible_suite_unresolved_replacements": visible_suite.get(
+            "unresolved_replacement_count", 0
+        ),
+        "visible_suite_sha256": visible_suite.get("suite_sha256", ""),
+        "visible_suite_details": visible_suite.get("details", ""),
         "visible_suite_reused": visible_suite.get("reused", False),
         "visible_suite_path": experiment_relative_path(
             visible_suite.get("suite_dir", ""),
+            experiment_dir,
+        ),
+        "visible_suite_preparation_history_path": experiment_relative_path(
+            visible_suite.get("preparation_history_path", ""),
             experiment_dir,
         ),
         "visible_generation_prompt_tokens": visible_suite.get(
@@ -301,6 +344,12 @@ def build_result_row(
         ),
         "visible_generation_completion_tokens": visible_suite.get(
             "completion_tokens", 0
+        ),
+        "visible_review_prompt_tokens": visible_suite.get(
+            "review_prompt_tokens", 0
+        ),
+        "visible_review_completion_tokens": visible_suite.get(
+            "review_completion_tokens", 0
         ),
         "visible_cases_total": visible.get("total_tests", 0),
         "visible_cases_passed": visible.get("rust_passed", 0),
@@ -364,6 +413,14 @@ def build_result_row(
             .get("validator_report", {})
             .get("test_assessment")
             == "invalid_visible_test"
+            for interaction in result.get("agent_interactions", [])
+        ),
+        "validator_inconclusive_count": sum(
+            interaction.get("action") == "semantic_analysis"
+            and interaction.get("data", {})
+            .get("validator_report", {})
+            .get("test_assessment")
+            == "inconclusive"
             for interaction in result.get("agent_interactions", [])
         ),
         "result_path": experiment_relative_path(
@@ -504,6 +561,7 @@ def summarize(rows: list[dict]) -> dict:
             "baseline_c_judge_status": Counter(),
             "validator_completed_analyses": 0,
             "validator_invalid_visible_tests": 0,
+            "validator_inconclusive": 0,
         }
     )
     for row in rows:
@@ -524,12 +582,52 @@ def summarize(rows: list[dict]) -> dict:
         summary["validator_invalid_visible_tests"] += int(
             row["validator_invalid_visible_test_count"]
         )
+        summary["validator_inconclusive"] += int(
+            row["validator_inconclusive_count"]
+        )
         for verdict in VERDICTS:
             summary["judge_verdict_counts"][verdict] += int(
                 row[f"judge_{verdict.lower()}_count"]
             )
+    suites = list({row["snippet_id"]: row for row in rows}.values())
+    suite_statuses = Counter(row.get("visible_suite_status", "") for row in suites)
+    review_statuses = Counter(
+        row.get("visible_suite_review_status", "") for row in suites
+    )
     return {
         "total_runs": len(rows),
+        "visible_suite_population": {
+            "programs": len(suites),
+            "status": dict(suite_statuses),
+            "review_status": dict(review_statuses),
+            "regenerated": sum(
+                int(row.get("visible_suite_generation_attempts", 0) or 0) > 1
+                for row in suites
+            ),
+            "generated_candidates": sum(
+                int(row.get("visible_suite_generated_candidates", 0) or 0)
+                for row in suites
+            ),
+            "rejected_candidates": sum(
+                int(row.get("visible_suite_rejected_candidates", 0) or 0)
+                for row in suites
+            ),
+            "invalid_cases": sum(
+                int(row.get("visible_suite_invalid_cases", 0) or 0)
+                for row in suites
+            ),
+            "inconclusive_cases": sum(
+                int(row.get("visible_suite_inconclusive_cases", 0) or 0)
+                for row in suites
+            ),
+            "unresolved_replacements": sum(
+                int(row.get("visible_suite_unresolved_replacements", 0) or 0)
+                for row in suites
+            ),
+            "approved_cases": sum(
+                int(row.get("visible_suite_cases", 0) or 0) for row in suites
+            ),
+        },
         "by_prompt": {
             prompt_id: {
                 key: dict(value) if isinstance(value, Counter) else value

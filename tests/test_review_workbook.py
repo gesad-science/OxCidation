@@ -10,7 +10,7 @@ from review_workbook import generate_review_workbook
 
 
 class ReviewWorkbookTests(unittest.TestCase):
-    def test_generates_blinded_review_sheets_and_links(self):
+    def test_generates_analysis_sheets_and_relative_links(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             experiment = Path(temp_dir)
             (experiment / "manifest.json").write_text(
@@ -29,6 +29,8 @@ class ReviewWorkbookTests(unittest.TestCase):
                 "snippet_id": "s1",
                 "problem_id": "p1",
                 "prompt_id": "direct",
+                "visible_suite_status": "ready",
+                "visible_suite_c_compile_profile": "gnu11",
                 "prompt_sha256": "hash",
                 "initial_compile_status": "success",
                 "initial_visible_test_status": "success",
@@ -41,7 +43,28 @@ class ReviewWorkbookTests(unittest.TestCase):
                 "final_code_path": "model_outputs/s1/direct/translated.rs",
                 "agent_interactions_path": "model_outputs/s1/direct/agent_interactions.json",
             }
-            self._write_csv(experiment / "results.csv", [result])
+            skipped_result = {
+                **result,
+                "review_id": "skipped-id",
+                "snippet_id": "s2",
+                "judge_status": "SKIPPED",
+            }
+            not_reached_result = {
+                **result,
+                "review_id": "not-reached-id",
+                "snippet_id": "s3",
+                "judge_status": "not_reached",
+            }
+            failed_result = {
+                **result,
+                "review_id": "failed-id",
+                "snippet_id": "s4",
+                "judge_status": "WRONG_ANSWER",
+            }
+            self._write_csv(
+                experiment / "results.csv",
+                [result, skipped_result, not_reached_result, failed_result],
+            )
             self._write_csv(
                 experiment / "attempts.csv",
                 [
@@ -55,15 +78,35 @@ class ReviewWorkbookTests(unittest.TestCase):
             path = generate_review_workbook(experiment)
             workbook = load_workbook(path)
 
-            self.assertEqual(workbook["Prompt Mapping"].sheet_state, "hidden")
+            self.assertNotIn("Prompt Mapping", workbook.sheetnames)
             self.assertEqual(workbook["Review Queue"]["A2"].value, "blind-id")
-            self.assertEqual(workbook["Reviews"].max_row, 3)
-            self.assertNotIn(
+            self.assertNotIn("Reviews", workbook.sheetnames)
+            self.assertNotIn("Adjudication", workbook.sheetnames)
+            self.assertIn(
                 "Prompt ID",
                 [cell.value for cell in workbook["Review Queue"][1]],
             )
-            self.assertEqual(workbook["Automatic Results"].max_column, 20)
+            self.assertEqual(workbook["Automatic Results"].max_column, 24)
             self.assertEqual(workbook["Attempts"].max_column, 19)
+            queue_headers = [
+                cell.value for cell in workbook["Review Queue"][1]
+            ]
+            self.assertIn("Visible Suite Status", queue_headers)
+            self.assertIn("Visible Suite C Compile Profile", queue_headers)
+            overview_headers = [
+                cell.value for cell in workbook["Overview"][8]
+            ]
+            self.assertIn("Judge failures", overview_headers)
+            self.assertIn("Judge skipped", overview_headers)
+            self.assertIn("Judge not reached", overview_headers)
+            overview_values = {
+                header: workbook["Overview"].cell(9, index + 1).value
+                for index, header in enumerate(overview_headers)
+            }
+            self.assertEqual(overview_values["Runs"], 4)
+            self.assertEqual(overview_values["Judge failures"], 1)
+            self.assertEqual(overview_values["Judge skipped"], 1)
+            self.assertEqual(overview_values["Judge not reached"], 1)
             self.assertIsNotNone(workbook["Artifact Index"]["D2"].hyperlink)
             self.assertFalse(
                 any(

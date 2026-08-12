@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from visible_testing import PROMPT_PATH, load_generation_prompt, prompt_sha256
+from visible_testing import (
+    PROMPT_PATH,
+    REVIEW_PROMPT_PATH,
+    load_generation_prompt,
+    load_review_prompt,
+    prompt_sha256,
+)
 
 
 IMPLEMENTATION_PATHS = (
@@ -47,6 +53,7 @@ def build_manifest(
     judge_profile,
 ) -> dict:
     visible_prompt = load_generation_prompt()
+    visible_review_prompt = load_review_prompt()
     manifest = {
         "experiment_id": experiment_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -76,8 +83,14 @@ def build_manifest(
             "prompt_path": str(PROMPT_PATH),
             "prompt_sha256": prompt_sha256(visible_prompt),
             "prompt_template": visible_prompt,
+            "review_prompt_path": str(REVIEW_PROMPT_PATH),
+            "review_prompt_sha256": prompt_sha256(visible_review_prompt),
+            "review_prompt_template": visible_review_prompt,
             "oracle": "accepted_c_execution",
             "reuse_policy": "one_suite_per_c_program",
+            "generation_attempt_limit": 2,
+            "stability_executions_per_candidate": 2,
+            "untrusted_evidence_policy": "no_translation_repair",
         },
         "pipeline": {
             "config_file": str(Path(configs.config_file).resolve()),
@@ -246,6 +259,16 @@ def _artifacts_complete(experiment_dir: Path, row: dict) -> bool:
     )
     if not row_matches_result:
         return False
+    if row.get("visible_suite_source") == "generated":
+        preparation_path = experiment_dir / row.get(
+            "visible_suite_preparation_history_path", ""
+        )
+        if not preparation_path.is_file():
+            return False
+        if result.get("visible_test_suite", {}).get("suite_sha256", "") != row.get(
+            "visible_suite_sha256", ""
+        ):
+            return False
     try:
         return (artifact_dir / "translated.rs").read_text(
             encoding="utf-8"

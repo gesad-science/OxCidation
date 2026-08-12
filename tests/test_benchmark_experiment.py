@@ -110,3 +110,48 @@ class BenchmarkResumeTests(unittest.TestCase):
                 completed_result_rows(experiment, [row]),
                 {("s1", "p1"): row},
             )
+
+    def test_completed_generated_run_requires_preparation_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            experiment = Path(temp_dir)
+            artifact_dir = experiment / "model_outputs" / "s1" / "p1"
+            artifact_dir.mkdir(parents=True)
+            result = {
+                "prompt_id": "p1",
+                "status": "success",
+                "judge_result": {"status": "ACCEPTED"},
+                "repair_count": 0,
+                "rust_code": "fn main() {}",
+                "agent_interactions": [],
+                "visible_test_suite": {"suite_sha256": "suite-hash"},
+            }
+            for name in REQUIRED_ARTIFACTS:
+                (artifact_dir / name).write_text("", encoding="utf-8")
+            (artifact_dir / "translated.rs").write_text(
+                result["rust_code"], encoding="utf-8"
+            )
+            (artifact_dir / "result.json").write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            row = {
+                "snippet_id": "s1",
+                "prompt_id": "p1",
+                "final_status": "success",
+                "judge_status": "ACCEPTED",
+                "repair_attempts": "0",
+                "result_path": "model_outputs/s1/p1/result.json",
+                "visible_suite_source": "generated",
+                "visible_suite_sha256": "suite-hash",
+                "visible_suite_preparation_history_path": (
+                    "visible_tests/s1/hash/preparation_history.json"
+                ),
+            }
+
+            self.assertEqual(completed_result_rows(experiment, [row]), {})
+            history = experiment / row["visible_suite_preparation_history_path"]
+            history.parent.mkdir(parents=True)
+            history.write_text("[]", encoding="utf-8")
+            self.assertEqual(
+                completed_result_rows(experiment, [row]),
+                {("s1", "p1"): row},
+            )

@@ -1,4 +1,4 @@
-"""Create an Excel workbook for blinded manual benchmark review."""
+"""Create an Excel workbook for benchmark analysis and artifact navigation."""
 
 import argparse
 import json
@@ -8,7 +8,6 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.datavalidation import DataValidation
 
 from benchmark_reporting import read_csv
 
@@ -25,11 +24,15 @@ AUTOMATIC_RESULT_FIELDS = [
     "initial_compile_status",
     "initial_visible_test_status",
     "initial_judge_status",
-    "initial_judge_cases_passed",
-    "initial_judge_cases_failed",
     "final_status",
     "failure_category",
     "visible_test_status",
+    "visible_suite_status",
+    "visible_suite_review_status",
+    "visible_suite_c_compile_profile",
+    "visible_suite_generation_attempts",
+    "visible_suite_inconclusive_cases",
+    "visible_suite_unresolved_replacements",
     "visible_cases_total",
     "visible_cases_passed",
     "judge_status",
@@ -76,6 +79,12 @@ ARTIFACT_FIELDS = [
     ),
     ("visible_test_suite", lambda row, directory: directory / "test_suite.json"),
     (
+        "visible_suite_preparation",
+        lambda row, directory: Path(
+            row.get("visible_suite_preparation_history_path", "")
+        ),
+    ),
+    (
         "validator_report",
         lambda row, directory: Path(row.get("validator_report_path", "")),
     ),
@@ -121,9 +130,6 @@ def generate_review_workbook(
         ATTEMPT_REVIEW_FIELDS,
         attempts,
     )
-    _write_reviews(workbook, results)
-    _write_adjudication(workbook, results)
-    _write_prompt_mapping(workbook, results)
     workbook.save(output_path)
     return output_path
 
@@ -144,7 +150,9 @@ def _write_overview(workbook: Workbook, manifest: dict, results: list[dict]) -> 
             "Initial accepted",
             "Final accepted",
             "Repaired",
-            "Final failures",
+            "Judge failures",
+            "Judge skipped",
+            "Judge not reached",
         ]
     )
     prompt_ids = sorted({row["prompt_id"] for row in results})
@@ -157,16 +165,32 @@ def _write_overview(workbook: Workbook, manifest: dict, results: list[dict]) -> 
                 _count(prompt_rows, "initial_judge_status", "ACCEPTED"),
                 _count(prompt_rows, "judge_status", "ACCEPTED"),
                 sum(int(row.get("repair_attempts", 0)) > 0 for row in prompt_rows),
-                sum(row.get("judge_status") not in {"ACCEPTED", "SKIPPED"} for row in prompt_rows),
+                sum(_is_judge_failure(row.get("judge_status")) for row in prompt_rows),
+                sum(_normalized_judge_status(row.get("judge_status")) == "SKIPPED" for row in prompt_rows),
+                sum(_judge_not_reached(row.get("judge_status")) for row in prompt_rows),
             ]
         )
     _style_sheet(sheet, freeze="A8", filter_row=8)
     sheet.column_dimensions["A"].width = 28
-    sheet.column_dimensions["B"].width = 28
+    for column in ("B", "C", "D", "E", "F", "G", "H"):
+        sheet.column_dimensions[column].width = 20
 
 
 def _count(rows: list[dict], field: str, value: str) -> int:
     return Counter(row.get(field) for row in rows)[value]
+
+
+def _normalized_judge_status(status: object) -> str:
+    return str(status or "").strip().upper()
+
+
+def _judge_not_reached(status: object) -> bool:
+    return _normalized_judge_status(status) in {"", "NOT_REACHED"}
+
+
+def _is_judge_failure(status: object) -> bool:
+    normalized = _normalized_judge_status(status)
+    return normalized not in {"", "ACCEPTED", "SKIPPED", "NOT_REACHED"}
 
 
 def _write_review_queue(
@@ -178,6 +202,9 @@ def _write_review_queue(
         "review_id",
         "snippet_id",
         "problem_id",
+        "prompt_id",
+        "visible_suite_status",
+        "visible_suite_c_compile_profile",
         "initial_compile_status",
         "initial_visible_test_status",
         "initial_judge_status",
@@ -199,6 +226,9 @@ def _write_review_queue(
                 row["review_id"],
                 row["snippet_id"],
                 row["problem_id"],
+                row["prompt_id"],
+                row.get("visible_suite_status", ""),
+                row.get("visible_suite_c_compile_profile", ""),
                 row["initial_compile_status"],
                 row["initial_visible_test_status"],
                 row["initial_judge_status"],
@@ -217,15 +247,18 @@ def _write_review_queue(
             "A": 20,
             "B": 18,
             "C": 14,
-            "D": 20,
-            "E": 24,
-            "F": 20,
-            "G": 16,
-            "H": 20,
-            "I": 16,
-            "J": 18,
-            "K": 42,
-            "L": 42,
+            "D": 28,
+            "E": 22,
+            "F": 22,
+            "G": 20,
+            "H": 24,
+            "I": 20,
+            "J": 16,
+            "K": 20,
+            "L": 16,
+            "M": 18,
+            "N": 42,
+            "O": 42,
         },
         default=18,
     )
@@ -297,64 +330,6 @@ def _compact_json(value, limit: int = 1200) -> str:
     return text if len(text) <= limit else f"{text[:limit - 3]}..."
 
 
-def _write_reviews(workbook: Workbook, results: list[dict]) -> None:
-    fields = [
-        "review_id",
-        "reviewer_id",
-        "semantic_correctness",
-        "robustness",
-        "performance",
-        "code_quality",
-        "preferred",
-        "notes",
-        "complete",
-    ]
-    rows = []
-    for result in sorted(results, key=lambda item: item["review_id"]):
-        for reviewer in ("reviewer-1", "reviewer-2"):
-            rows.append(
-                {
-                    "review_id": result["review_id"],
-                    "reviewer_id": reviewer,
-                }
-            )
-    _write_table(workbook, "Reviews", fields, rows)
-    sheet = workbook["Reviews"]
-    _add_score_validation(sheet, "C2:F1048576")
-    _add_list_validation(sheet, "G2:G1048576", '"yes,no,undecided"')
-    _add_list_validation(sheet, "I2:I1048576", '"yes,no"')
-
-
-def _write_adjudication(workbook: Workbook, results: list[dict]) -> None:
-    fields = [
-        "review_id",
-        "requires_adjudication",
-        "adjudicator_id",
-        "final_semantic_correctness",
-        "final_robustness",
-        "final_performance",
-        "final_code_quality",
-        "selected",
-        "decision_notes",
-    ]
-    rows = [
-        {"review_id": result["review_id"]}
-        for result in sorted(results, key=lambda item: item["review_id"])
-    ]
-    _write_table(workbook, "Adjudication", fields, rows)
-    sheet = workbook["Adjudication"]
-    _add_list_validation(sheet, "B2:B1048576", '"yes,no"')
-    _add_score_validation(sheet, "D2:G1048576")
-    _add_list_validation(sheet, "H2:H1048576", '"yes,no"')
-
-
-def _write_prompt_mapping(workbook: Workbook, results: list[dict]) -> None:
-    fields = ["review_id", "snippet_id", "problem_id", "prompt_id", "prompt_sha256"]
-    rows = [{field: row.get(field, "") for field in fields} for row in results]
-    _write_table(workbook, "Prompt Mapping", fields, rows)
-    workbook["Prompt Mapping"].sheet_state = "hidden"
-
-
 def _write_table(
     workbook: Workbook,
     name: str,
@@ -388,26 +363,6 @@ def _set_file_link(cell, target: Path) -> None:
 
 def _header_label(field: str) -> str:
     return field.replace("_", " ").title().replace(" Id", " ID")
-
-
-def _add_score_validation(sheet, cell_range: str) -> None:
-    validation = DataValidation(
-        type="whole",
-        operator="between",
-        formula1="1",
-        formula2="5",
-        allow_blank=True,
-    )
-    validation.error = "Enter an integer from 1 to 5."
-    validation.errorTitle = "Invalid score"
-    sheet.add_data_validation(validation)
-    validation.add(cell_range)
-
-
-def _add_list_validation(sheet, cell_range: str, values: str) -> None:
-    validation = DataValidation(type="list", formula1=values, allow_blank=True)
-    sheet.add_data_validation(validation)
-    validation.add(cell_range)
 
 
 def _style_sheet(sheet, freeze: str, filter_row: int) -> None:

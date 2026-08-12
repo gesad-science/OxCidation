@@ -1,13 +1,17 @@
+import asyncio
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from benchmark import (
     Prompt,
     SourceProgram,
+    filter_judge_eligible_sources,
     load_sources,
+    prepare_visible_suite,
     select_sources,
     server_environment,
 )
@@ -40,6 +44,15 @@ class BenchmarkSelectionTests(unittest.TestCase):
         second = select_sources(sources, 4, 42)
 
         self.assertEqual(first, second)
+
+    def test_judge_filter_runs_before_sampling(self):
+        sources = [SourceProgram(f"p{index}", Path(f"s{index}.c")) for index in range(4)]
+        judge = _JudgeCoverage({("s1", "p1"), ("s3", "p3")})
+
+        eligible = filter_judge_eligible_sources(sources, judge)
+        selected = select_sources(eligible, 2, 42)
+
+        self.assertEqual({source.problem_id for source in selected}, {"p1", "p3"})
 
 
 class BenchmarkCsvTests(unittest.TestCase):
@@ -87,6 +100,7 @@ class BenchmarkCsvTests(unittest.TestCase):
 
         attempt = extract_attempts(result)[0]
 
+        self.assertEqual(attempt["translation_status"], "success")
         self.assertEqual(attempt["initial_judge_status"], "WRONG_ANSWER")
         self.assertEqual(attempt["final_judge_status"], "WRONG_ANSWER")
 
@@ -106,6 +120,17 @@ class BenchmarkCsvTests(unittest.TestCase):
                     "source": "generated",
                     "candidate_count": 3,
                     "case_count": 2,
+                    "review_status": "approved",
+                    "c_compile_profile": "gnu89-compat",
+                    "generation_attempt_count": 2,
+                    "generated_candidate_count": 5,
+                    "rejected_candidate_count": 1,
+                    "invalid_case_count": 1,
+                    "suite_sha256": "suite-hash",
+                    "details": "",
+                    "preparation_history_path": str(
+                        root / "visible_tests" / "s1" / "preparation_history.json"
+                    ),
                     "suite_dir": str(root / "visible_tests" / "s1" / "hash"),
                 },
                 "judge_result": {"status": "WRONG_ANSWER", "total": 3, "passed": 2, "failed": 1, "verdict_counts": {"WRONG_ANSWER": 1}},
@@ -149,12 +174,33 @@ class BenchmarkCsvTests(unittest.TestCase):
             self.assertEqual(row["judge_wrong_answer_count"], 1)
             self.assertEqual(row["judge_accepted_count"], 0)
             self.assertEqual(row["visible_suite_cases"], 2)
+            self.assertEqual(row["visible_suite_review_status"], "approved")
+            self.assertEqual(
+                row["visible_suite_c_compile_profile"],
+                "gnu89-compat",
+            )
+            self.assertEqual(row["visible_suite_generation_attempts"], 2)
+            self.assertEqual(row["visible_suite_generated_candidates"], 5)
+            self.assertEqual(row["visible_suite_rejected_candidates"], 1)
+            self.assertEqual(row["visible_suite_invalid_cases"], 1)
+            self.assertEqual(row["visible_suite_sha256"], "suite-hash")
+            self.assertEqual(row["visible_suite_details"], "")
+            self.assertEqual(
+                row["visible_suite_preparation_history_path"],
+                "visible_tests/s1/preparation_history.json",
+            )
             self.assertEqual(row["visible_suite_path"], "visible_tests/s1/hash")
             self.assertEqual(row["validator_completed_analysis_count"], 1)
             self.assertEqual(row["validator_invalid_visible_test_count"], 1)
             summary = summarize([row])["by_prompt"]["direct"]
             self.assertEqual(summary["validator_completed_analyses"], 1)
             self.assertEqual(summary["validator_invalid_visible_tests"], 1)
+            suite_summary = summarize([row])["visible_suite_population"]
+            self.assertEqual(suite_summary["programs"], 1)
+            self.assertEqual(suite_summary["regenerated"], 1)
+            self.assertEqual(suite_summary["generated_candidates"], 5)
+            self.assertEqual(suite_summary["invalid_cases"], 1)
+            self.assertEqual(suite_summary["approved_cases"], 2)
 
             source.path.write_text("int main() {}", encoding="utf-8")
             write_artifacts(artifact_dir, source, result)
@@ -181,3 +227,40 @@ class BenchmarkProcessTests(unittest.TestCase):
                 str(config_path.resolve()),
             )
             self.assertEqual(environment.get("PATH"), os.environ.get("PATH"))
+
+    def test_operational_visible_preparation_failure_stops_the_benchmark(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = root / "sample.c"
+            source_path.write_text("int main(void) { return 0; }", encoding="utf-8")
+            source = SourceProgram("p1", source_path)
+            session = _VisiblePreparationSession(
+                {
+                    "status": "review_failed",
+                    "details": "Visible-test review failed: provider unavailable.",
+                }
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+                asyncio.run(prepare_visible_suite(session, source, root))
+
+
+class _VisiblePreparationSession:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def call_tool(self, tool_name, arguments):
+        self.tool_name = tool_name
+        self.arguments = arguments
+        return SimpleNamespace(
+            content=[SimpleNamespace(text=json.dumps(self.payload))],
+            isError=False,
+        )
+
+
+class _JudgeCoverage:
+    def __init__(self, covered):
+        self.covered = covered
+
+    def can_evaluate(self, snippet_id, problem_id):
+        return (snippet_id, problem_id) in self.covered

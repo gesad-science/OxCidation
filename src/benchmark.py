@@ -39,6 +39,7 @@ from judge_comparison import JudgeComparison, JudgeProfile
 from logger_setup import RunRecorder, configure_log_directory
 from orchestrator import process_file
 from review_workbook import generate_review_workbook
+from visible_testing import OPERATIONAL_PREPARATION_STATUSES
 
 LOGGER = logging.getLogger(__name__)
 PROMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -116,6 +117,17 @@ def select_sources(sources: list[SourceProgram], sample_size: int, seed: int) ->
     )
 
 
+def filter_judge_eligible_sources(
+    sources: list[SourceProgram],
+    judge_comparison: JudgeComparison,
+) -> list[SourceProgram]:
+    return [
+        source
+        for source in sources
+        if judge_comparison.can_evaluate(source.path.stem, source.problem_id)
+    ]
+
+
 def server_environment(configs: ConfigDetails) -> dict[str, str]:
     environment = os.environ.copy()
     environment["OXCIDATION_CONFIG_FILE"] = str(Path(configs.config_file).resolve())
@@ -129,19 +141,21 @@ async def prepare_visible_suite(
 ) -> dict:
     test_root = experiment_dir / "visible_tests" / source.path.stem
     try:
-        return await TesterAgent(session).prepare_suite(
+        suite = await TesterAgent(session).prepare_suite(
             source.path.read_text(encoding="utf-8"),
             str(test_root),
         )
     except Exception as error:
-        LOGGER.error("Visible-test generation failed for %s: %s", source.path.name, error)
-        return {
-            "status": "generation_failed",
-            "source": "generated",
-            "suite_dir": str(test_root),
-            "case_count": 0,
-            "details": str(error),
-        }
+        raise RuntimeError(
+            f"Visible-test preparation failed for {source.path.name}: {error}"
+        ) from error
+
+    if suite.get("status") in OPERATIONAL_PREPARATION_STATUSES:
+        raise RuntimeError(
+            f"Visible-test preparation failed for {source.path.name}: "
+            f"{suite.get('details', suite['status'])}"
+        )
+    return suite
 
 
 def build_judge_comparison(args: argparse.Namespace, configs: ConfigDetails) -> JudgeComparison | None:
@@ -203,9 +217,15 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     prompts = load_prompts(prompt_dir)
     source_manifest = Path(args.source_manifest) if args.source_manifest else None
     population = load_sources(input_dir, source_manifest)
-    sources = select_sources(population, args.sample_size, args.seed)
     configs = ConfigDetails()
     judge_comparison = build_judge_comparison(args, configs)
+    if judge_comparison is not None:
+        population = filter_judge_eligible_sources(population, judge_comparison)
+        LOGGER.info(
+            "Judge-eligible population: %d programs with limits and test cases.",
+            len(population),
+        )
+    sources = select_sources(population, args.sample_size, args.seed)
     manifest = build_manifest(
         args.experiment_id,
         sources,

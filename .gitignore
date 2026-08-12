@@ -146,6 +146,7 @@ extra-progress/
 */session.txt
 session.txt
 data/processed/aoj_system_tests/
+data/processed/aoj_problem_mapping/
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -199,3 +200,4 @@ data/processed/benchmark_population*.summary.json
 !prompts/benchmark/
 !prompts/benchmark/*.txt
 !prompts/visible_test_generation_prompt.txt
+!prompts/visible_test_review_prompt.txt

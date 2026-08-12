@@ -134,17 +134,55 @@ Use `--require-rust-accepted` only when reproducing the historical Gold Standard
   --selection-seed 42
 ```
 
-## Prefetch AOJ System Tests
+## Map Accepted-C Problems to AOJ
 
-Use `prepare_aoj_system_tests.py` to process the complete accepted-C problem manifest and build a reusable local Judge corpus for every retrievable problem:
+CodeNet problem IDs are anonymized and cannot be converted to AOJ IDs by
+removing the `p` prefix. Build a verified mapping by comparing the exact
+SHA-256 hash of each accepted-C CodeNet description with the descriptions
+served by AOJ:
+
+```bash
+./.venv/bin/python prepare_aoj_problem_mapping.py \
+  --problem-manifest /path/to/CodeNet/Project_CodeNet_C_Accepted/manifests/problems.csv \
+  --descriptions-root /path/to/CodeNet/Project_CodeNet_C_Accepted/problem_descriptions \
+  --source-manifest data/processed/benchmark_population.csv \
+  --output-root data/processed/aoj_problem_mapping
+```
+
+Only problems from the accepted-C manifest are considered. AtCoder rows are
+counted as excluded because this mapping is specifically between CodeNet and
+AOJ. Titles, limits, numeric suffixes, source comments, and execution outcomes
+do not decide identity. A problem is mapped only when its local description
+hash identifies exactly one AOJ problem across the available English and
+Japanese descriptions.
+
+The AOJ catalog and descriptions are cached under `<output-root>/cache/`.
+Interrupting and rerunning the command reuses valid cached responses. The final
+files are:
+
+- `mapping_results.csv`: every accepted-C AIZU problem and its mapping status;
+- `mapped_problems.csv`: exactly mapped problems for system-test retrieval;
+- `benchmark_population.csv`: the supplied one-program-per-problem population filtered to exactly mapped problems;
+- `mapping_summary.json`: input hashes, coverage counts, cache statistics, and mapping outcomes.
+
+Problems without a CodeNet description, without an exact AOJ match, or with an
+ambiguous exact match remain explicitly unmapped. They are not guessed or
+included in the Judge-backed population.
+
+## Prefetch Mapped AOJ System Tests
+
+Use `prepare_aoj_system_tests.py` with the verified mapping manifest:
 
 ```bash
 ./.venv/bin/python prepare_aoj_system_tests.py \
-  --problem-manifest /path/to/CodeNet/Project_CodeNet_C_Accepted/manifests/problems.csv \
-  --output-root /path/to/CodeNet/aoj_system_tests
+  --problem-manifest data/processed/aoj_problem_mapping/mapped_problems.csv \
+  --output-root /path/to/CodeNet/aoj_system_tests_mapped
 ```
 
-The command deduplicates problems and downloads complete system suites for AIZU rows. AtCoder rows are retained in the final report with status `unsupported_dataset` because equivalent system-test access is not currently available.
+The downloader receives an explicit `aoj_problem_id` for every CodeNet
+problem. It never infers an external ID. Use a new output root: suites fetched
+before exact mapping used incorrect problem associations and are not valid
+research evidence under their existing CodeNet directories.
 
 By default, six problem workers share a global limit of eight HTTP requests per second. This overlaps API latency without allowing every worker to issue requests at the full rate. Use `--workers` and `--requests-per-second` to tune these limits when needed.
 
@@ -154,9 +192,9 @@ Retry only rows still classified as `failed` with:
 
 ```bash
 ./.venv/bin/python prepare_aoj_system_tests.py \
-  --problem-manifest /path/to/CodeNet/Project_CodeNet_C_Accepted/manifests/problems.csv \
-  --output-root /path/to/CodeNet/aoj_system_tests \
-  --retry-failed-from /path/to/CodeNet/aoj_system_tests/prefetch_results.csv
+  --problem-manifest data/processed/aoj_problem_mapping/mapped_problems.csv \
+  --output-root /path/to/CodeNet/aoj_system_tests_mapped \
+  --retry-failed-from /path/to/CodeNet/aoj_system_tests_mapped/prefetch_results.csv
 ```
 
 The targeted retry merges its results into the existing complete report. AOJ headers that explicitly declare unavailable content are recorded as `unavailable`, not repeatedly treated as network failures. A one-byte excess caused by a returned terminal newline is accepted and recorded in the suite manifest; other size discrepancies remain failures for investigation.
@@ -165,8 +203,8 @@ For a small live check before starting the full population:
 
 ```bash
 ./.venv/bin/python prepare_aoj_system_tests.py \
-  --problem-manifest /path/to/CodeNet/Project_CodeNet_C_Accepted/manifests/problems.csv \
-  --output-root /path/to/CodeNet/aoj_system_tests \
+  --problem-manifest data/processed/aoj_problem_mapping/mapped_problems.csv \
+  --output-root /path/to/CodeNet/aoj_system_tests_mapped \
   --limit 5
 ```
 
@@ -183,6 +221,11 @@ Point the benchmark's `--judge-tests-root` option at this output root. AOJ cases
 
 Use this command when comparing translation prompts for one selected model. `--experiment-id` must be new, except for an empty directory left by an early configuration failure.
 
+When Judge options are provided, sampling is restricted to programs with
+problem limits in the metadata and at least one matched Judge input/output
+pair. The seed is applied after this eligibility filter. Without Judge options,
+the benchmark samples from the complete source manifest.
+
 ### Gemini benchmark with integrated Judge
 
 ```bash
@@ -190,13 +233,13 @@ GEMINI_API_KEY="..." \
 OXCIDATION_CONFIG_FILE=config/gemini-3.1-flash-lite.yaml \
 ./.venv/bin/python src/benchmark.py \
   --experiment-id gemini-flash-lite-smoke-08 \
-  --input-dir /path/to/CodeNet/Project_CodeNet/data \
-  --source-manifest data/processed/benchmark_population.csv \
+  --input-dir /path/to/CodeNet/Project_CodeNet_C_Accepted/data \
+  --source-manifest data/processed/aoj_problem_mapping/benchmark_population.csv \
   --prompts-dir prompts/benchmark \
   --sample-size 20 \
   --seed 42 \
-  --judge-tests-root /path/to/CodeNet/Project_CodeNet/derived/input_output/data \
-  --metadata-root /path/to/CodeNet/Project_CodeNet/metadata
+  --judge-tests-root /path/to/CodeNet/aoj_system_tests_mapped \
+  --metadata-root /path/to/CodeNet/Project_CodeNet_C_Accepted/metadata
 ```
 
 ### OpenAI benchmark with integrated Judge
@@ -206,31 +249,39 @@ OPENAI_API_KEY="..." \
 OXCIDATION_CONFIG_FILE=config/openai-benchmark.yaml \
 ./.venv/bin/python src/benchmark.py \
   --experiment-id openai-smoke-01 \
-  --input-dir /path/to/CodeNet/Project_CodeNet/data \
-  --source-manifest data/processed/benchmark_population.csv \
+  --input-dir /path/to/CodeNet/Project_CodeNet_C_Accepted/data \
+  --source-manifest data/processed/aoj_problem_mapping/benchmark_population.csv \
   --prompts-dir prompts/benchmark \
   --sample-size 20 \
   --seed 42 \
-  --judge-tests-root /path/to/CodeNet/Project_CodeNet/derived/input_output/data \
-  --metadata-root /path/to/CodeNet/Project_CodeNet/metadata
+  --judge-tests-root /path/to/CodeNet/aoj_system_tests_mapped \
+  --metadata-root /path/to/CodeNet/Project_CodeNet_C_Accepted/metadata
 ```
 
-The benchmark first asks the configured model to generate concrete standard-input cases from each C source. The model chooses the suite size and never receives the problem statement or Judge cases. OxCidation executes the accepted C program to reject unusable inputs and produce the expected `.out` files.
+The benchmark first asks the configured model to generate concrete standard-input cases from each C source. The model chooses the suite size and never receives the problem statement or Judge cases. Each candidate is executed twice against the accepted C program; duplicate, failing, timed-out, or unstable candidates are rejected deterministically.
+
+Before any translation prompt runs, the Validator reviews every generated candidate independently, using only the C source and the deterministic execution report. Cases approved by both stages are kept. Rejected cases receive one bounded replacement round, while approved cases are preserved. Replacement cases that remain rejected or inconclusive are discarded. Visible testing is disabled only when no approved case remains; translation and Judge evaluation still continue. The resulting suite is frozen and shared by every translation prompt.
+
+An LLM invocation or structured-response failure is recorded as an operational preparation failure, not as an inconclusive Validator assessment. The benchmark stops before translating that program, and `--resume` retries preparation so prompts are never evaluated with different suites.
 
 It then performs the following work for every `program x prompt` pair:
 
 1. Translates C to Rust and saves the raw response.
 2. Compiles Rust and asks the Evaluator to record a Judge result for the initial translation.
 3. Executes C and Rust against the same generated visible-test suite.
-4. On a visible differential failure, asks the Validator whether the evidence represents a translation discrepancy or an invalid visible test.
+4. On a visible differential failure, asks the Validator whether the evidence represents a translation discrepancy, an invalid visible test, or inconclusive evidence.
 5. Applies visible-test repairs when requested and records each code attempt.
 6. Asks the Evaluator to record the final Judge result.
 
-Valid translation discrepancies can trigger repair; invalid or unreliable visible-test evidence never modifies Rust and proceeds to independent Judge evaluation. Semantic repairs receive the original C source, current Rust translation, Validator guidance, and failure category.
+Only confirmed translation discrepancies can trigger repair. Invalid, inconclusive, or unavailable visible-test evidence never modifies Rust and proceeds to independent Judge evaluation. Semantic repairs receive the original C source, current Rust translation, Validator guidance, and failure category.
+
+Reaching the repair limit also proceeds to the Evaluator. The final Judge result is therefore recorded even when compilation or visible tests still fail; no Judge result can trigger another repair.
 
 Initial and final Judge results are observational. They are never sent to the Validator or Translator and cannot trigger repair. When no repair changes the code, the final Evaluator step reuses the initial Judge result instead of executing the same code twice.
 
-The visible-test suite is generated once per C program and reused for every translation prompt and repair attempt. Reuse requires matching C-source and generation-prompt hashes. Its fixed prompt is stored in `prompts/visible_test_generation_prompt.txt`; translation prompts remain under `prompts/benchmark/`.
+The visible-test suite is prepared once per C program and reused for every translation prompt and repair attempt. Reuse requires matching C-source, generation-prompt, review-prompt, provider, and model identities. The fixed prompts are stored in `prompts/visible_test_generation_prompt.txt` and `prompts/visible_test_review_prompt.txt`; translation prompts remain under `prompts/benchmark/`.
+
+The local C oracle first compiles with `gnu11`, then makes one compatibility attempt with `gnu89` for historical accepted sources. The suite manifest records the successful profile and both attempt outcomes. If neither profile compiles, the suite is marked `baseline_compile_failed`, contributes no visible-test evidence, and the independent Judge evaluation still runs.
 
 Prompt order is deterministically shuffled for each program using the experiment seed. `execution_order` and `prompt_position` preserve the request order, while analytical files remain sorted by stable program and prompt identifiers.
 
@@ -241,18 +292,18 @@ The command prints the path to `results.csv` when the benchmark completes. It cr
 - `manifest.json`: selected programs, prompts, model profile, and Judge profile.
 - `results.csv`: one row per `program x prompt`, with explicit initial and final outcomes.
 - `attempts.csv`: one row per initial translation or repair attempt.
-- `summary.json`: aggregate outcomes by prompt.
-- `review_workbook.xlsx`: blinded, linked workbook for two reviewers and adjudication.
+- `summary.json`: aggregate outcomes by prompt plus deduplicated visible-suite preparation statistics.
+- `review_workbook.xlsx`: linked workbook for result analysis and artifact navigation.
 - `runs.jsonl`: workflow records from the translation pipeline.
 - `resume_history.jsonl`: one entry per accepted `--resume` invocation.
-- `visible_tests/<submission_id>/<source-hash>/`: generated inputs, C oracle outputs, generation record, and suite manifest shared by all prompts.
+- `visible_tests/<submission_id>/<source-hash>/`: frozen suite manifest, preparation history, and isolated generation-attempt directories containing candidate records, reviews, inputs, and C oracle outputs.
 - `model_outputs/<submission_id>/<prompt_id>/`: source C, initial/final Judge comparisons, versioned Rust attempts, raw response, final test/Validator reports, complete `agent_interactions.json`, and full result JSON.
 
 `agent_interactions.json` is chronological and preserves every translation, compilation, visible-test report, Validator analysis and decision, repair request/response, and final Judge decision. The final `test_report.json` and `validator_report.json` remain convenience snapshots and may describe only the last successful attempt.
 
 Each interaction records a sequence number, causal predecessor, agent, action, repair attempt, and action-specific data. Reports, compiler diagnostics, and code versions are stored once; later events refer to their causal predecessor instead of copying the same payload. This makes a failure loop directly traceable, for example: `visible_test_report` -> `semantic_analysis` -> `visible_test_decision` -> `repair` -> `compilation` -> `visible_test_report`. `semantic_analysis_skipped` explicitly identifies transitions where no LLM analysis occurred.
 
-The CSV fields `validator_completed_analysis_count` and `validator_invalid_visible_test_count` report completed semantic analyses and rejected visible-test evidence respectively, while `agent_interactions_path` links to the complete history.
+The `visible_suite_*` CSV fields report review status, generation attempts, candidate counts, suite hash, and the source-level preparation-history path. `validator_completed_analysis_count`, `validator_invalid_visible_test_count`, and `validator_inconclusive_count` describe post-translation differential analyses. `agent_interactions_path` links to the per-combination translation and repair history without duplicating suite preparation messages.
 
 ### Resume an interrupted benchmark
 
@@ -263,13 +314,13 @@ GEMINI_API_KEY="..." \
 OXCIDATION_CONFIG_FILE=config/gemini-3.1-flash-lite.yaml \
 ./.venv/bin/python src/benchmark.py \
   --experiment-id gemini-flash-lite-smoke-08 \
-  --input-dir /path/to/CodeNet/Project_CodeNet/data \
-  --source-manifest data/processed/benchmark_population.csv \
+  --input-dir /path/to/CodeNet/Project_CodeNet_C_Accepted/data \
+  --source-manifest data/processed/aoj_problem_mapping/benchmark_population.csv \
   --prompts-dir prompts/benchmark \
   --sample-size 20 \
   --seed 42 \
-  --judge-tests-root /path/to/CodeNet/Project_CodeNet/derived/input_output/data \
-  --metadata-root /path/to/CodeNet/Project_CodeNet/metadata \
+  --judge-tests-root /path/to/CodeNet/aoj_system_tests_mapped \
+  --metadata-root /path/to/CodeNet/Project_CodeNet_C_Accepted/metadata \
   --resume
 ```
 
@@ -284,7 +335,7 @@ PYTHONPATH=src ./.venv/bin/python src/review_workbook.py \
   outputs/<experiment-id>
 ```
 
-`Review Queue` uses blinded `review_id` values and presents only the principal initial/final outcomes and compact failure evidence. `Artifact Index` centralizes relative external links to source, code attempts, reports, interactions, and complete JSON results without displaying raw paths. `Automatic Results` and `Attempts` contain curated analytical fields rather than complete CSV mirrors. `Prompt Mapping` is hidden to avoid exposing prompt identity during review; unhide it when analysis is complete. `Reviews` contains two rows per result, and `Adjudication` records the third reviewer’s decision when required.
+`Review Queue` presents prompt identity, the principal initial/final outcomes, and compact failure evidence. `Artifact Index` centralizes relative external links to source, code attempts, reports, interactions, and complete JSON results without displaying raw paths. `Automatic Results` and `Attempts` contain curated analytical fields rather than complete CSV mirrors. Stable `review_id` values connect the same result across these sheets.
 
 The C Judge profile uses `gcc:5.4` with `gcc -O2 -pipe source.c -o program -lm`. The Rust profile uses `rust:1.85.0-bookworm`. Per-problem time and memory limits come from `metadata/problem_list.csv`; the stack limit is set to the problem memory limit.
 

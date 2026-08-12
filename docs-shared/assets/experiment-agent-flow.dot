@@ -1,0 +1,207 @@
+digraph OxCidationExperiment {
+  graph [
+    rankdir=TB,
+    bgcolor="#FAFBFC",
+    pad="0.35",
+    nodesep="0.35",
+    ranksep="0.55",
+    splines=ortho,
+    fontname="DejaVu Sans",
+    fontsize=18,
+    labelloc=t,
+    label="OxCidation experiment flow - agent and module perspective"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#344054",
+    fillcolor="#FFFFFF",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    margin="0.18,0.12"
+  ];
+  edge [
+    color="#667085",
+    fontcolor="#344054",
+    fontname="DejaVu Sans",
+    fontsize=9,
+    arrowsize=0.75,
+    penwidth=1.25
+  ];
+
+  start [
+    label="EXPERIMENT ORCHESTRATOR\nSelect C programs, prompts, model and seed\nbenchmark.py",
+    fillcolor="#E9EDF2",
+    color="#475467"
+  ];
+
+  subgraph cluster_preparation {
+    label="PHASE A - ONCE PER C PROGRAM: PREPARE SHARED VISIBLE EVIDENCE";
+    color="#98A2B3";
+    fillcolor="#F5F7F9";
+    style="rounded,filled";
+    fontname="DejaVu Sans";
+    fontsize=13;
+
+    generate [
+      label="TESTER AGENT\nGenerate language-agnostic input candidates\nC source only",
+      fillcolor="#DDF3EE",
+      color="#267A6E"
+    ];
+    deterministic [
+      label="DETERMINISTIC TEST ENGINE\nCompile C; run each input twice\nReject duplicates, failures, timeouts and unstable output\nvisible_test_preparation.py",
+      fillcolor="#E7F3E8",
+      color="#3A7D44"
+    ];
+    suite_review [
+      label="VALIDATOR AGENT\nReview C + surviving inputs + deterministic report\nNo Rust, problem statement or Judge data",
+      fillcolor="#FFF1CC",
+      color="#A46A00"
+    ];
+    suite_decision [
+      shape=diamond,
+      style=filled,
+      label="Suite\nassessment",
+      fillcolor="#FFF8E7",
+      color="#A46A00",
+      width=1.4,
+      height=0.9
+    ];
+    regenerate [
+      label="TESTER AGENT\nGenerate replacements once\nonly for rejected cases",
+      fillcolor="#DDF3EE",
+      color="#267A6E"
+    ];
+    frozen [
+      label="FROZEN SUITE\nC oracle outputs + suite hash\nShared by every translation prompt",
+      fillcolor="#E0F2F1",
+      color="#267A6E"
+    ];
+    unavailable [
+      label="VISIBLE TESTS DISABLED\nNo approved cases remain\nTranslation and Judge still continue",
+      fillcolor="#F2F4F7",
+      color="#667085"
+    ];
+    operational [
+      label="OPERATIONAL FAILURE\ngeneration_failed / review_failed\nStop before translation; --resume retries",
+      fillcolor="#FDE8E7",
+      color="#B42318"
+    ];
+
+    generate -> deterministic;
+    deterministic -> suite_review;
+    suite_review -> suite_decision;
+    suite_decision -> frozen [xlabel="approved"];
+    suite_decision -> regenerate [xlabel="rejected cases"];
+    regenerate -> deterministic [xlabel="replacement candidates"];
+    suite_decision -> unavailable [xlabel="no approved cases"];
+    generate -> operational [style=dashed, color="#B42318", xlabel="LLM failure"];
+    suite_review -> operational [style=dashed, color="#B42318", xlabel="LLM or parsing failure"];
+  }
+
+  prompt_entry [
+    label="EXPERIMENT ORCHESTRATOR\nFor each program x translation prompt\nReuse the same frozen or disabled suite state",
+    fillcolor="#E9EDF2",
+    color="#475467"
+  ];
+
+  subgraph cluster_prompt_run {
+    label="PHASE B - ONCE PER PROGRAM x PROMPT: TRANSLATE, REPAIR AND EVALUATE";
+    color="#98A2B3";
+    fillcolor="#F8F9FB";
+    style="rounded,filled";
+    fontname="DejaVu Sans";
+    fontsize=13;
+
+    translate [
+      label="TRANSLATOR AGENT\nGenerate the initial Rust translation\nPreserve raw response and Rust source",
+      fillcolor="#DCEBFA",
+      color="#175CD3"
+    ];
+    compile [
+      label="COMPILER + VALIDATOR ROUTING\nCompile Rust and inspect diagnostics\nCompile failure may request bounded repair",
+      fillcolor="#E8EEF8",
+      color="#475467"
+    ];
+    compile_repair [
+      label="TRANSLATOR AGENT\nRepair compilation failure",
+      fillcolor="#DCEBFA",
+      color="#175CD3"
+    ];
+    initial_judge [
+      label="EVALUATOR AGENT\nRecord initial Judge observation\nNever used as repair feedback",
+      fillcolor="#FCE7E2",
+      color="#B54708"
+    ];
+    visible_run [
+      label="TESTER AGENT\nRun C and Rust on the shared visible suite\nProduce differential TestReport",
+      fillcolor="#DDF3EE",
+      color="#267A6E"
+    ];
+    visible_result [
+      shape=diamond,
+      style=filled,
+      label="Visible\nevidence",
+      fillcolor="#F0FAF7",
+      color="#267A6E",
+      width=1.4,
+      height=0.9
+    ];
+    semantic_review [
+      label="VALIDATOR AGENT\nAnalyze C + Rust + differential report\nClassify the evidence",
+      fillcolor="#FFF1CC",
+      color="#A46A00"
+    ];
+    semantic_decision [
+      shape=diamond,
+      style=filled,
+      label="Validator\nassessment",
+      fillcolor="#FFF8E7",
+      color="#A46A00",
+      width=1.5,
+      height=0.95
+    ];
+    semantic_repair [
+      label="TRANSLATOR AGENT\nOnly for confirmed translation_discrepancy\nApply repair, then recompile and rerun tests",
+      fillcolor="#DCEBFA",
+      color="#175CD3"
+    ];
+    final_judge [
+      label="EVALUATOR AGENT\nAfter pass, skip, invalid test or inconclusive evidence\nRun or reuse final Judge comparison and case counts",
+      fillcolor="#FCE7E2",
+      color="#B54708"
+    ];
+    close_run [
+      label="VALIDATOR ROUTING\nClose the workflow\nJudge cannot trigger repair",
+      fillcolor="#FFF1CC",
+      color="#A46A00"
+    ];
+
+    translate -> compile;
+    compile -> compile_repair [xlabel="compile failure"];
+    compile_repair -> compile [xlabel="bounded retry"];
+    compile -> initial_judge [xlabel="compiled"];
+    initial_judge -> visible_run;
+    visible_run -> visible_result;
+    visible_result -> final_judge [xlabel="pass / skipped / unavailable"];
+    visible_result -> semantic_review [xlabel="C passed; Rust failed"];
+    semantic_review -> semantic_decision;
+    semantic_decision -> semantic_repair;
+    semantic_repair -> visible_run [xlabel="bounded recompile / retest loop"];
+    semantic_decision -> final_judge;
+    final_judge -> close_run;
+  }
+
+  reports [
+    label="REPORTING MODULES\nCSV + JSON + attempt history + agent interactions\nJudge reports + Excel analysis workbook\nbenchmark_reporting.py / review_workbook.py",
+    fillcolor="#EDE7F6",
+    color="#6941C6"
+  ];
+
+  start -> generate;
+  frozen -> prompt_entry;
+  unavailable -> prompt_entry;
+  prompt_entry -> translate;
+  close_run -> reports;
+}

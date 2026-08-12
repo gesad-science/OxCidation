@@ -1,0 +1,136 @@
+digraph OxCidationMainExperiment {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    bgcolor="#FAFBFC",
+    pad="0.3",
+    nodesep="0.4",
+    ranksep="0.65",
+    splines=ortho,
+    fontname="DejaVu Sans",
+    fontsize=18,
+    labelloc=t,
+    label="OxCidation main experiment - simplified agent flow"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#344054",
+    fillcolor="#FFFFFF",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    margin="0.2,0.13"
+  ];
+  edge [
+    color="#667085",
+    fontcolor="#344054",
+    fontname="DejaVu Sans",
+    fontsize=9,
+    arrowsize=0.75,
+    penwidth=1.25
+  ];
+
+  start [
+    label="ORCHESTRATOR\nSelect one C program\nUse the fixed translation prompt",
+    fillcolor="#E9EDF2",
+    color="#475467"
+  ];
+
+  subgraph cluster_test_preparation {
+    label="1. PREPARE VISIBLE TESTS";
+    color="#98A2B3";
+    fillcolor="#F5F7F9";
+    style="rounded,filled";
+    fontname="DejaVu Sans";
+    fontsize=13;
+
+    { rank=same;
+      tester_prepare [
+        label="TESTER\nGenerate candidate inputs\nand run execution checks",
+        fillcolor="#DDF3EE",
+        color="#267A6E"
+      ];
+      validator_suite [
+        label="VALIDATOR\nReview each test case\nReplace rejected cases once",
+        fillcolor="#FFF1CC",
+        color="#A46A00"
+      ];
+      suite_state [
+        label="TEST STATE\nFrozen visible suite\nor tests unavailable",
+        fillcolor="#E9EDF2",
+        color="#475467"
+      ];
+    }
+
+    tester_prepare -> validator_suite;
+    validator_suite -> suite_state;
+    validator_suite -> tester_prepare [
+      style=dashed,
+      constraint=false
+    ];
+  }
+
+  subgraph cluster_execution {
+    label="2. TRANSLATE, TEST AND EVALUATE";
+    color="#98A2B3";
+    fillcolor="#F8F9FB";
+    style="rounded,filled";
+    fontname="DejaVu Sans";
+    fontsize=13;
+
+    { rank=same;
+      translator [
+        label="TRANSLATOR\nTranslate C to Rust\nand resolve compilation errors",
+        fillcolor="#DCEBFA",
+        color="#175CD3"
+      ];
+      initial_judge [
+        label="EVALUATOR\nRecord the initial\nJudge result",
+        fillcolor="#FCE7E2",
+        color="#B54708"
+      ];
+      tester_run [
+        label="TESTER\nCompare C and Rust\non visible tests",
+        fillcolor="#DDF3EE",
+        color="#267A6E"
+      ];
+    }
+
+    { rank=same;
+      repair [
+        label="TRANSLATOR\nApply guided repair",
+        fillcolor="#DCEBFA",
+        color="#175CD3"
+      ];
+      validator_translation [
+        label="VALIDATOR\nAnalyze a differential failure\nConfirm or decline repair",
+        fillcolor="#FFF1CC",
+        color="#A46A00"
+      ];
+      final_judge [
+        label="EVALUATOR\nRecord the final Judge result\nJudge never requests repair",
+        fillcolor="#FCE7E2",
+        color="#B54708"
+      ];
+    }
+
+    translator -> initial_judge;
+    initial_judge -> tester_run;
+    tester_run -> validator_translation;
+    tester_run -> final_judge;
+    validator_translation -> repair;
+    repair -> tester_run [style=dashed, constraint=false];
+    validator_translation -> final_judge;
+  }
+
+  reports [
+    label="REPORTS\nTranslation, visible-test and Judge evidence",
+    fillcolor="#EDE7F6",
+    color="#6941C6"
+  ];
+
+  start -> tester_prepare;
+  suite_state -> translator;
+  final_judge -> reports;
+}

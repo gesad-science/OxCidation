@@ -26,6 +26,10 @@ STATUS_PRIORITY = [
     "WRONG_ANSWER",
     "INFRA_ERROR",
 ]
+C_COMPILER_PROFILES = (
+    ("gnu11", ("-std=gnu11",)),
+    ("gnu89-compat", ("-std=gnu89",)),
+)
 
 
 def compile_c(source_code: str, temp_dir: str) -> tuple[subprocess.CompletedProcess, str]:
@@ -33,11 +37,29 @@ def compile_c(source_code: str, temp_dir: str) -> tuple[subprocess.CompletedProc
     executable_path = os.path.join(temp_dir, "prog_c")
     with open(source_path, "w", encoding="utf-8") as source_file:
         source_file.write(source_code)
-    result = subprocess.run(
-        ["gcc", source_path, "-o", executable_path, "-lm"],
-        capture_output=True,
-        text=True,
+    attempts = []
+    result = None
+    for profile, flags in C_COMPILER_PROFILES:
+        result = subprocess.run(
+            ["gcc", *flags, source_path, "-o", executable_path, "-lm"],
+            capture_output=True,
+            text=True,
+        )
+        attempts.append(
+            {
+                "profile": profile,
+                "status": "success" if result.returncode == 0 else "failed",
+            }
+        )
+        if result.returncode == 0:
+            break
+
+    if result is None:
+        raise RuntimeError("No C compiler profile was configured.")
+    result.compile_profile = (
+        attempts[-1]["profile"] if result.returncode == 0 else ""
     )
+    result.compile_attempts = attempts
     return result, executable_path
 
 
@@ -181,6 +203,9 @@ def run_oj_suite(
         "--tle",
         str(timeout_sec),
     ]
+    for input_name in list_input_cases(test_dir):
+        input_path = os.path.join(test_dir, input_name)
+        args.extend((input_path, input_path.removesuffix(".in") + ".out"))
     started_at = time.time()
     run = subprocess.run(args, capture_output=True, text=True, env=oj_environment())
     return classify_oj_output(

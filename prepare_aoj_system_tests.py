@@ -4,26 +4,22 @@ from __future__ import annotations
 
 import argparse
 import csv
-import email.utils
-import hashlib
 import json
 import os
-import random
 import re
 import threading
-import time
 import urllib.error
-import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from aoj_api import AojHttpClient, atomic_write_bytes, atomic_write_json, sha256
+
 
 API_ROOT = "https://judgedat.u-aizu.ac.jp/testcases"
 TOOL_VERSION = 2
-PROBLEM_ID_RE = re.compile(r"p(\d{5})")
 SAFE_CASE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 REPORT_FIELDS = (
     "problem_id",
@@ -42,6 +38,7 @@ REPORT_FIELDS = (
 class Problem:
     problem_id: str
     dataset: str
+    external_problem_id: str
 
 
 @dataclass(frozen=True)
@@ -54,61 +51,6 @@ class TestCaseHeader:
 
 class SuiteUnavailableError(ValueError):
     pass
-
-
-class RequestRateLimiter:
-    """Share a fixed request rate across all downloader workers."""
-
-    def __init__(self, requests_per_second: float):
-        self._interval = 1.0 / requests_per_second
-        self._next_request = 0.0
-        self._lock = threading.Lock()
-
-    def wait(self) -> None:
-        with self._lock:
-            now = time.monotonic()
-            delay = max(0.0, self._next_request - now)
-            self._next_request = max(now, self._next_request) + self._interval
-        if delay:
-            time.sleep(delay)
-
-
-class AojHttpClient:
-    def __init__(
-        self,
-        requests_per_second: float,
-        timeout_sec: float,
-        retries: int,
-        stop_event: threading.Event,
-    ):
-        self._rate_limiter = RequestRateLimiter(requests_per_second)
-        self._timeout_sec = timeout_sec
-        self._retries = retries
-        self._stop_event = stop_event
-
-    def get(self, url: str) -> bytes:
-        for attempt in range(self._retries + 1):
-            if self._stop_event.is_set():
-                raise InterruptedError("Extraction interrupted.")
-            self._rate_limiter.wait()
-            request = urllib.request.Request(
-                url,
-                headers={"User-Agent": "OxCidation-AOJ-test-prefetch/1"},
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self._timeout_sec) as response:
-                    return response.read()
-            except urllib.error.HTTPError as error:
-                if error.code not in {429, 500, 502, 503, 504} or attempt == self._retries:
-                    raise
-                delay = retry_delay(error.headers.get("Retry-After"), attempt)
-            except (TimeoutError, urllib.error.URLError):
-                if attempt == self._retries:
-                    raise
-                delay = retry_delay(None, attempt)
-            if self._stop_event.wait(delay):
-                raise InterruptedError("Extraction interrupted.")
-        raise RuntimeError("HTTP retry loop ended unexpectedly.")
 
 
 class AojSuiteDownloader:
@@ -127,7 +69,7 @@ class AojSuiteDownloader:
         if problem.dataset.casefold() != "aizu":
             return result_row(problem, "unsupported_dataset", details="AOJ tests are unavailable.")
 
-        external_id = external_aoj_id(problem.problem_id)
+        external_id = problem.external_problem_id
         final_directory = self.output_root / problem.problem_id
         if final_directory.exists():
             try:
@@ -216,13 +158,6 @@ class AojSuiteDownloader:
         atomic_write_bytes(input_path, input_bytes)
         atomic_write_bytes(output_path, output_bytes)
         return case_record(case, input_bytes, output_bytes, fallback_used, size_validation)
-
-
-def external_aoj_id(problem_id: str) -> str:
-    match = PROBLEM_ID_RE.fullmatch(problem_id)
-    if not match:
-        raise ValueError(f"Invalid CodeNet problem ID: {problem_id}")
-    return match.group(1)[-4:]
 
 
 def parse_header(header_bytes: bytes, expected_problem_id: str) -> list[TestCaseHeader]:
@@ -364,19 +299,20 @@ def validate_completed_suite(directory: Path, problem: Problem, external_id: str
 def load_problems(manifest_path: Path) -> list[Problem]:
     with manifest_path.open(newline="", encoding="utf-8") as manifest_file:
         reader = csv.DictReader(manifest_file)
-        required = {"problem_id", "dataset"}
+        required = {"problem_id", "dataset", "aoj_problem_id"}
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError(
-                f"Problem manifest must contain {sorted(required)}; use the accepted-C "
-                "subset's manifests/problems.csv file."
+                f"Problem mapping must contain {sorted(required)}; use mapped_problems.csv "
+                "from prepare_aoj_problem_mapping.py."
             )
         problems = {
             row["problem_id"].strip(): Problem(
                 problem_id=row["problem_id"].strip(),
                 dataset=row["dataset"].strip(),
+                external_problem_id=row["aoj_problem_id"].strip(),
             )
             for row in reader
-            if row["problem_id"].strip()
+            if row["problem_id"].strip() and row["aoj_problem_id"].strip()
         }
     return [problems[problem_id] for problem_id in sorted(problems)]
 
@@ -413,34 +349,6 @@ def result_from_manifest(problem: Problem, external_id: str, status: str, manife
         manifest["input_bytes"],
         manifest["output_bytes"],
         manifest["fallback_cases"],
-    )
-
-
-def retry_delay(retry_after: str | None, attempt: int) -> float:
-    if retry_after:
-        try:
-            return max(0.0, float(retry_after))
-        except ValueError:
-            retry_time = email.utils.parsedate_to_datetime(retry_after)
-            return max(0.0, retry_time.timestamp() - time.time())
-    return min(30.0, 0.5 * (2**attempt)) + random.uniform(0.0, 0.25)
-
-
-def sha256(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-def atomic_write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    temporary.write_bytes(content)
-    os.replace(temporary, path)
-
-
-def atomic_write_json(path: Path, payload: dict) -> None:
-    atomic_write_bytes(
-        path,
-        (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
     )
 
 
@@ -557,7 +465,7 @@ def parse_args() -> argparse.Namespace:
         "--problem-manifest",
         required=True,
         type=Path,
-        help="Accepted-C manifests/problems.csv with problem_id and dataset columns.",
+        help="Verified mapped_problems.csv produced by prepare_aoj_problem_mapping.py.",
     )
     parser.add_argument(
         "--output-root",

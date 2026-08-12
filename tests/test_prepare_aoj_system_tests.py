@@ -12,7 +12,6 @@ from prepare_aoj_system_tests import (  # noqa: E402
     API_ROOT,
     AojSuiteDownloader,
     Problem,
-    external_aoj_id,
     failed_problem_ids,
     load_problems,
     validate_completed_suite,
@@ -20,28 +19,53 @@ from prepare_aoj_system_tests import (  # noqa: E402
 
 
 class AojSystemTestPreparationTests(unittest.TestCase):
-    def test_maps_codenet_ids_to_four_digit_aoj_ids(self):
-        self.assertEqual(external_aoj_id("p00001"), "0001")
-        self.assertEqual(external_aoj_id("p02300"), "2300")
-
-    def test_loads_unique_problems_and_requires_dataset(self):
+    def test_loads_unique_problems_with_verified_aoj_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manifest = Path(temp_dir) / "problems.csv"
             with manifest.open("w", newline="", encoding="utf-8") as output:
-                writer = csv.DictWriter(output, fieldnames=("problem_id", "dataset"))
+                writer = csv.DictWriter(
+                    output,
+                    fieldnames=("problem_id", "dataset", "aoj_problem_id"),
+                )
                 writer.writeheader()
                 writer.writerows(
                     [
-                        {"problem_id": "p00002", "dataset": "AIZU"},
-                        {"problem_id": "p00001", "dataset": "AIZU"},
-                        {"problem_id": "p00001", "dataset": "AIZU"},
+                        {
+                            "problem_id": "p00565",
+                            "dataset": "AIZU",
+                            "aoj_problem_id": "0642",
+                        },
+                        {
+                            "problem_id": "p00636",
+                            "dataset": "AIZU",
+                            "aoj_problem_id": "1050",
+                        },
+                        {
+                            "problem_id": "p00565",
+                            "dataset": "AIZU",
+                            "aoj_problem_id": "0642",
+                        },
                     ]
                 )
 
             self.assertEqual(
                 load_problems(manifest),
-                [Problem("p00001", "AIZU"), Problem("p00002", "AIZU")],
+                [
+                    Problem("p00565", "AIZU", "0642"),
+                    Problem("p00636", "AIZU", "1050"),
+                ],
             )
+
+    def test_rejects_an_unmapped_accepted_c_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "problems.csv"
+            manifest.write_text(
+                "problem_id,dataset\np00565,AIZU\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "aoj_problem_id"):
+                load_problems(manifest)
 
     def test_downloads_complete_suite_and_reuses_valid_cache(self):
         header = {
@@ -67,7 +91,7 @@ class AojSystemTestPreparationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             output_root = Path(temp_dir) / "tests"
-            problem = Problem("p00001", "AIZU")
+            problem = Problem("p00001", "AIZU", "0001")
             first = AojSuiteDownloader(output_root, get_bytes).download(problem)
 
             self.assertEqual(first["status"], "downloaded")
@@ -104,7 +128,7 @@ class AojSystemTestPreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_root = Path(temp_dir) / "tests"
             result = AojSuiteDownloader(output_root, responses.__getitem__).download(
-                Problem("p02300", "AIZU")
+                Problem("p02300", "AIZU", "2300")
             )
             manifest = json.loads(
                 (output_root / "p02300" / "suite_manifest.json").read_text(encoding="utf-8")
@@ -136,7 +160,7 @@ class AojSystemTestPreparationTests(unittest.TestCase):
                 return json.dumps({"in": "c\n", "out": "d\n"}).encode()
 
             result = AojSuiteDownloader(output_root, get_bytes).download(
-                Problem("p00002", "AIZU")
+                Problem("p00002", "AIZU", "0002")
             )
 
             self.assertEqual(result["case_count"], 2)
@@ -157,7 +181,7 @@ class AojSystemTestPreparationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             result = AojSuiteDownloader(Path(temp_dir), get_bytes).download(
-                Problem("p00248", "AIZU")
+                Problem("p00248", "AIZU", "0248")
             )
 
         self.assertEqual(result["status"], "unavailable")
@@ -177,7 +201,7 @@ class AojSystemTestPreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_root = Path(temp_dir)
             result = AojSuiteDownloader(output_root, responses.__getitem__).download(
-                Problem("p00072", "AIZU")
+                Problem("p00072", "AIZU", "0072")
             )
             manifest = json.loads(
                 (output_root / "p00072" / "suite_manifest.json").read_text(encoding="utf-8")

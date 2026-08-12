@@ -86,6 +86,13 @@ class JudgeComparison:
                 "rust": evaluate_program("rust", rust_code, test_directory, limits, self.profile),
             }
 
+    def can_evaluate(self, snippet_id: str, problem_id: str) -> bool:
+        return problem_id in self._limits and has_test_cases(
+            self.profile.tests_root,
+            snippet_id,
+            problem_id,
+        )
+
     @staticmethod
     def _load_limits(path: Path) -> dict[str, ProblemLimits]:
         if not path.is_file():
@@ -122,7 +129,7 @@ def resolve_test_directory(
 ) -> tuple[Path | None, str]:
     for key in (snippet_id, problem_id):
         candidate = tests_root / key
-        if candidate.is_dir() and list_input_cases(str(candidate)):
+        if has_paired_io_cases(candidate):
             return candidate, "io-directory"
 
         input_path = candidate / "input.txt"
@@ -134,6 +141,25 @@ def resolve_test_directory(
             shutil.copyfile(output_path, normalized / "1.out")
             return normalized, "codenet-single-case"
     return None, "missing"
+
+
+def has_test_cases(tests_root: Path, snippet_id: str, problem_id: str) -> bool:
+    for key in (snippet_id, problem_id):
+        candidate = tests_root / key
+        if has_paired_io_cases(candidate):
+            return True
+        if (candidate / "input.txt").is_file() and (candidate / "output.txt").is_file():
+            return True
+    return False
+
+
+def has_paired_io_cases(directory: Path) -> bool:
+    if not directory.is_dir():
+        return False
+    input_paths = list(directory.glob("*.in"))
+    return bool(input_paths) and all(
+        input_path.with_suffix(".out").is_file() for input_path in input_paths
+    )
 
 
 def skipped_program(reason: str) -> dict:
@@ -182,13 +208,18 @@ def evaluate_program(
             }
         try:
             command = execution_command(executable, profile, container_id)
-            judge_result = run_judge_suite(test_directory, command, limits.time_limit_ms, profile)
+            suite_result = run_judge_suite(
+                test_directory,
+                command,
+                limits.time_limit_ms,
+                profile,
+            )
         finally:
             stop_execution_container(container_id, profile)
         return {
             "compile_status": "success",
             "compiler_output": compiler_output,
-            "judge": judge_result,
+            "judge": suite_result,
         }
 
 

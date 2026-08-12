@@ -7,6 +7,7 @@ from judge_comparison import (
     JudgeComparison,
     JudgeProfile,
     ProblemLimits,
+    has_test_cases,
     start_execution_container,
     resolve_test_directory,
 )
@@ -21,6 +22,7 @@ class SmokeJudgeTestDirectoryTests(unittest.TestCase):
             cases.mkdir()
             (cases / "1.in").write_text("1\n", encoding="utf-8")
             (cases / "1.out").write_text("1\n", encoding="utf-8")
+            (cases / "suite_manifest.json").write_text("{}", encoding="utf-8")
 
             directory, layout = resolve_test_directory(root, "s1", "p1", root / "normalized")
 
@@ -40,6 +42,23 @@ class SmokeJudgeTestDirectoryTests(unittest.TestCase):
             self.assertEqual(layout, "codenet-single-case")
             self.assertEqual((directory / "1.in").read_text(encoding="utf-8"), "1\n")
             self.assertEqual((directory / "1.out").read_text(encoding="utf-8"), "2\n")
+
+    def test_requires_a_matching_output_for_io_directory_coverage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cases = root / "p1"
+            cases.mkdir()
+            (cases / "1.in").write_text("1\n", encoding="utf-8")
+
+            self.assertFalse(has_test_cases(root, "s1", "p1"))
+
+            (cases / "1.out").write_text("2\n", encoding="utf-8")
+
+            self.assertTrue(has_test_cases(root, "s1", "p1"))
+
+            (cases / "2.in").write_text("2\n", encoding="utf-8")
+
+            self.assertFalse(has_test_cases(root, "s1", "p1"))
 
     def test_container_command_uses_problem_memory_for_stack_and_memory(self):
         profile = JudgeProfile(Path("tests"), Path("metadata"))

@@ -18,12 +18,12 @@ from pydantic import BaseModel, Field
 from config import ConfigDetails
 from judge_execution import compile_rust
 from rate_limit import RequestRateLimiter
+from visible_test_preparation import prepare_generated_suite
 from visible_testing import (
     evaluate_visible_suite,
     find_reusable_suite,
     load_generation_prompt,
-    materialize_generated_suite,
-    record_generation_failure,
+    load_review_prompt,
 )
 
 load_dotenv()
@@ -45,17 +45,20 @@ class TranslationResult(BaseModel):
 
 
 class SemanticValidationResult(BaseModel):
-    test_assessment: Literal["translation_discrepancy", "invalid_visible_test"] = Field(
+    test_assessment: Literal[
+        "translation_discrepancy",
+        "invalid_visible_test",
+        "inconclusive",
+    ] = Field(
         description=(
             "Whether the evidence demonstrates a Rust translation discrepancy or an "
-            "invalid, incomplete, or unreliable visible test."
+            "invalid visible test, or is insufficient for either conclusion."
         )
     )
     diagnosis: str = Field(description="Concise diagnosis of the differential test failure.")
     repair_guidance: str = Field(
         description=(
-            "Concrete repair guidance for a translation_discrepancy; empty for an "
-            "invalid_visible_test."
+            "Concrete repair guidance for a translation_discrepancy; empty otherwise."
         )
     )
     semantic_discrepancies: list[str] = Field(
@@ -73,6 +76,24 @@ class GeneratedVisibleTestSuite(BaseModel):
     cases: list[GeneratedVisibleTestCase] = Field(
         min_length=1,
         description="Concrete standard-input cases. Choose the necessary number of cases.",
+    )
+
+
+class VisibleTestCaseReview(BaseModel):
+    case_id: str = Field(description="Identifier of the reviewed generated case.")
+    assessment: Literal["approved", "invalid", "inconclusive"] = Field(
+        description="Whether this individual input is supported by the C source."
+    )
+    diagnosis: str = Field(description="Concise evidence for this case assessment.")
+    regeneration_guidance: str = Field(
+        description="Replacement guidance for this case; empty when approved."
+    )
+
+
+class VisibleTestSuiteReview(BaseModel):
+    case_reviews: list[VisibleTestCaseReview] = Field(
+        min_length=1,
+        description="Exactly one review for every supplied case identifier.",
     )
 
 
@@ -122,12 +143,53 @@ def invoke_llm(llm, prompt: str):
     return llm.invoke(prompt)
 
 
+def token_usage(response) -> dict:
+    usage = getattr(response, "usage_metadata", None) or {}
+    if not usage:
+        metadata = getattr(response, "response_metadata", None) or {}
+        usage = metadata.get("token_usage", {})
+    return {
+        "input_tokens": (
+            usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+        ),
+        "output_tokens": (
+            usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+        ),
+    }
+
+
+def invoke_structured(llm, schema, prompt: str, operation: str) -> tuple[dict, dict]:
+    try:
+        response = invoke_llm(
+            llm.with_structured_output(
+                schema,
+                method="json_schema",
+                strict=True,
+                include_raw=True,
+            ),
+            prompt,
+        )
+        if response.get("parsing_error"):
+            raise response["parsing_error"]
+        return response["parsed"].model_dump(), token_usage(response["raw"])
+    except Exception as strict_error:
+        logger.warning("Structured %s failed: %s", operation, strict_error)
+        parser = JsonOutputParser(pydantic_object=schema)
+        response = invoke_llm(
+            llm.bind(response_format={"type": "json_object"}),
+            f"{parser.get_format_instructions()}\n\n{prompt}",
+        )
+        return parser.invoke(response.content), token_usage(response)
+
+
 @mcp.tool()
 def compile_rust_code(source_code: str) -> str:
     """Compiles Rust and returns compiler output."""
     with tempfile.TemporaryDirectory() as temp_dir:
         result, _ = compile_rust(source_code, temp_dir)
-    return f"Success:\n{result.stdout}" if result.returncode == 0 else f"Compilation Failed:\n{result.stderr}"
+    if result.returncode == 0:
+        return f"Success:\n{result.stdout}"
+    return f"Compilation Failed:\n{result.stderr}"
 
 
 @mcp.tool()
@@ -139,46 +201,31 @@ def translate_c_to_rust(c_code: str, prompt_template: str | None = None) -> str:
     prompt = prompt_template.replace("{c_code}", c_code)
     llm = get_llm()
     try:
-        response = invoke_llm(
-            llm.with_structured_output(TranslationResult, method="json_schema", strict=True),
+        payload, usage = invoke_structured(
+            llm,
+            TranslationResult,
             prompt,
+            "translation",
         )
+        rust_code = clean_markdown_code(payload.get("rust_code", ""))
         return json.dumps(
             {
-                "rust_code": clean_markdown_code(response.rust_code),
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "raw_model_output": response.rust_code,
+                "rust_code": rust_code,
+                "prompt_tokens": usage["input_tokens"],
+                "completion_tokens": usage["output_tokens"],
+                "raw_model_output": rust_code,
             }
         )
-    except Exception as strict_error:
-        logger.warning("Structured translation failed: %s", strict_error)
-        try:
-            parser = JsonOutputParser(pydantic_object=TranslationResult)
-            response = invoke_llm(
-                llm.bind(response_format={"type": "json_object"}),
-                f"You are an expert C to Rust translator.\n{parser.get_format_instructions()}\n\n{prompt}",
-            )
-            payload = parser.invoke(response.content)
-            usage = response.usage_metadata or {}
-            return json.dumps(
-                {
-                    "rust_code": clean_markdown_code(payload.get("rust_code", "")),
-                    "prompt_tokens": usage.get("input_tokens", 0),
-                    "completion_tokens": usage.get("output_tokens", 0),
-                    "raw_model_output": response.content,
-                }
-            )
-        except Exception as fallback_error:
-            return json.dumps(
-                {
-                    "rust_code": "",
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "raw_model_output": "",
-                    "error": f"LLM parsing failed completely: {fallback_error}",
-                }
-            )
+    except Exception as error:
+        return json.dumps(
+            {
+                "rust_code": "",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "raw_model_output": "",
+                "error": f"LLM parsing failed completely: {error}",
+            }
+        )
 
 
 @mcp.tool()
@@ -197,10 +244,25 @@ def repair_rust_code(
         f"Issues:\n{errors}\n\nReturn ONLY fixed Rust code without markdown."
     )
     try:
-        return clean_markdown_code(invoke_llm(get_llm(), prompt).content)
+        response = invoke_llm(get_llm(), prompt)
+        usage = token_usage(response)
+        return json.dumps(
+            {
+                "rust_code": clean_markdown_code(response.content),
+                "prompt_tokens": usage["input_tokens"],
+                "completion_tokens": usage["output_tokens"],
+            }
+        )
     except Exception as error:
         logger.error("Repair failed: %s", error)
-        return ""
+        return json.dumps(
+            {
+                "rust_code": "",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "error": str(error),
+            }
+        )
 
 
 @mcp.tool()
@@ -212,7 +274,8 @@ def analyze_translation_discrepancy(c_code: str, rust_code: str, test_report: di
         "First verify that the failing inputs are complete and valid for every input operation "
         "performed by the C source. If an input is malformed, incomplete, or makes the C oracle "
         "depend on undefined or uninitialized data, classify it as invalid_visible_test and do "
-        "not recommend changing Rust to accept it. Otherwise classify it as "
+        "not recommend changing Rust to accept it. If the available evidence cannot support "
+        "either conclusion, classify it as inconclusive. Otherwise classify it as "
         "translation_discrepancy and provide concise behavior-preserving repair guidance. "
         "Identify only supported discrepancies. "
         "Do not reveal hidden chain-of-thought.\n\n"
@@ -221,79 +284,93 @@ def analyze_translation_discrepancy(c_code: str, rust_code: str, test_report: di
     )
     llm = get_llm()
     try:
-        response = invoke_llm(
-            llm.with_structured_output(SemanticValidationResult, method="json_schema", strict=True),
+        payload, usage = invoke_structured(
+            llm,
+            SemanticValidationResult,
             prompt,
+            "translation-discrepancy analysis",
         )
-        return json.dumps(response.model_dump())
-    except Exception as strict_error:
-        logger.warning("Structured validator analysis failed: %s", strict_error)
-        parser = JsonOutputParser(pydantic_object=SemanticValidationResult)
-        response = invoke_llm(
-            llm.bind(response_format={"type": "json_object"}),
-            f"{parser.get_format_instructions()}\n\n{prompt}",
+        return json.dumps(
+            {
+                **payload,
+                "prompt_tokens": usage["input_tokens"],
+                "completion_tokens": usage["output_tokens"],
+            }
         )
-        return json.dumps(parser.invoke(response.content))
+    except Exception as error:
+        logger.error("Validator analysis failed: %s", error)
+        raise
 
 
 @mcp.tool()
 def generate_visible_test_suite(c_code: str, test_root: str) -> str:
-    """Generates language-agnostic inputs and materializes C oracle outputs."""
-    prompt_template = load_generation_prompt()
-    existing_suite = find_reusable_suite(test_root, c_code, prompt_template)
+    """Generates, reviews, and freezes one language-agnostic visible-test suite."""
+    generation_prompt = load_generation_prompt()
+    review_prompt = load_review_prompt()
+    existing_suite = find_reusable_suite(
+        test_root,
+        c_code,
+        generation_prompt,
+        review_prompt,
+        configs.llm_provider,
+        configs.llm_model,
+    )
     if existing_suite is not None:
         return json.dumps(existing_suite, ensure_ascii=False)
 
-    prompt = prompt_template.replace("{c_code}", c_code)
-    try:
-        llm = get_llm()
-    except Exception as error:
-        suite = record_generation_failure(
-            c_code,
-            test_root,
-            prompt_template,
-            f"Visible-test model initialization failed: {error}",
-        )
-        return json.dumps(suite, ensure_ascii=False)
+    llm = None
 
-    try:
-        response = invoke_llm(
-            llm.with_structured_output(
-                GeneratedVisibleTestSuite,
-                method="json_schema",
-                strict=True,
-            ),
+    def active_llm():
+        nonlocal llm
+        if llm is None:
+            llm = get_llm()
+        return llm
+
+    def generate_candidates(regeneration_feedback: str) -> tuple[dict, dict]:
+        prompt = generation_prompt.replace("{c_code}", c_code)
+        if regeneration_feedback:
+            prompt += (
+                "\n\nGenerate replacement cases only for the rejected candidates described "
+                "below. Previously approved cases are preserved; do not repeat or rewrite "
+                "them. Follow the requested replacement count.\n"
+                f"Replacement guidance: {regeneration_feedback}"
+            )
+        return invoke_structured(
+            active_llm(),
+            GeneratedVisibleTestSuite,
             prompt,
+            "visible-test generation",
         )
-        generation = response.model_dump()
-        usage = {}
-    except Exception as strict_error:
-        logger.warning("Structured visible-test generation failed: %s", strict_error)
-        try:
-            parser = JsonOutputParser(pydantic_object=GeneratedVisibleTestSuite)
-            response = invoke_llm(
-                llm.bind(response_format={"type": "json_object"}),
-                f"{parser.get_format_instructions()}\n\n{prompt}",
-            )
-            generation = parser.invoke(response.content)
-            usage = response.usage_metadata or {}
-        except Exception as fallback_error:
-            suite = record_generation_failure(
-                c_code,
-                test_root,
-                prompt_template,
-                f"Visible-test generation failed: {fallback_error}",
-            )
-            return json.dumps(suite, ensure_ascii=False)
 
-    suite = materialize_generated_suite(
+    def review_candidates(
+        cases: list[dict],
+        deterministic_report: dict,
+    ) -> tuple[dict, dict]:
+        prompt = review_prompt.replace("{c_code}", c_code).replace(
+            "{cases}",
+            json.dumps(cases, ensure_ascii=False),
+        )
+        prompt = prompt.replace(
+            "{deterministic_report}",
+            json.dumps(deterministic_report, ensure_ascii=False),
+        )
+        return invoke_structured(
+            active_llm(),
+            VisibleTestSuiteReview,
+            prompt,
+            "visible-test review",
+        )
+
+    suite = prepare_generated_suite(
         c_code,
-        generation,
         test_root,
         configs.visible_test_time_limit_sec,
-        prompt_template,
-        usage.get("input_tokens", 0),
-        usage.get("output_tokens", 0),
+        generation_prompt,
+        review_prompt,
+        configs.llm_provider,
+        configs.llm_model,
+        generate_candidates,
+        review_candidates,
     )
     return json.dumps(suite, ensure_ascii=False)
 

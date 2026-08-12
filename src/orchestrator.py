@@ -18,7 +18,6 @@ from agents import (
     TesterAgent,
 )
 from config import ConfigDetails
-from contracts import ValidationDecision
 from logger_setup import RunRecorder, setup_environment_and_logger
 
 logger = setup_environment_and_logger(__name__)
@@ -27,6 +26,7 @@ configs = ConfigDetails()
 
 COMPILE_ROUTES = {
     "run_visible_tests": "test_node",
+    "run_judge": "judge_node",
     "repair_translation": "repair_node",
     "stop_failed": END,
 }
@@ -55,24 +55,20 @@ def _judge_comparison(config: RunnableConfig):
     return config["configurable"].get("judge_comparison")
 
 
-def _route(decision: ValidationDecision, mapping: dict):
-    return mapping.get(decision["next_action"], END)
-
-
 def route_after_compile_validation(state: AgentState):
-    return _route(state["validation_decision"], COMPILE_ROUTES)
+    return state["validation_decision"]["next_action"]
 
 
 def route_after_translation_validation(state: AgentState):
-    return _route(state["validation_decision"], TRANSLATION_ROUTES)
+    return state["validation_decision"]["next_action"]
 
 
 def route_after_visible_validation(state: AgentState):
-    return _route(state["validation_decision"], VISIBLE_TEST_ROUTES)
+    return state["validation_decision"]["next_action"]
 
 
 def route_after_judge_validation(state: AgentState):
-    return _route(state["validation_decision"], JUDGE_ROUTES)
+    return state["validation_decision"]["next_action"]
 
 
 async def translate_node(
@@ -160,15 +156,28 @@ workflow.add_edge("translate_node", "validate_translation_node")
 workflow.add_conditional_edges(
     "validate_translation_node",
     route_after_translation_validation,
+    TRANSLATION_ROUTES,
 )
 workflow.add_edge("compile_node", "validate_compile_node")
-workflow.add_conditional_edges("validate_compile_node", route_after_compile_validation)
+workflow.add_conditional_edges(
+    "validate_compile_node",
+    route_after_compile_validation,
+    COMPILE_ROUTES,
+)
 workflow.add_edge("repair_node", "compile_node")
 workflow.add_edge("test_node", "analyze_visible_node")
 workflow.add_edge("analyze_visible_node", "validate_visible_node")
-workflow.add_conditional_edges("validate_visible_node", route_after_visible_validation)
+workflow.add_conditional_edges(
+    "validate_visible_node",
+    route_after_visible_validation,
+    VISIBLE_TEST_ROUTES,
+)
 workflow.add_edge("judge_node", "validate_judge_node")
-workflow.add_conditional_edges("validate_judge_node", route_after_judge_validation)
+workflow.add_conditional_edges(
+    "validate_judge_node",
+    route_after_judge_validation,
+    JUDGE_ROUTES,
+)
 app = workflow.compile()
 
 
@@ -201,6 +210,13 @@ def _log_file_outcome(file_name: str, out_path: str, result: AgentState):
         logger.info(f"[{file_name}] Validation skipped. Saved Rust output to {out_path}")
         if judge_status:
             logger.info(f"[{file_name}] Judge evaluation status: {judge_status}")
+        return
+
+    if status == "evaluated":
+        logger.info(
+            f"[{file_name}] Judge evaluation completed with status {judge_status}. "
+            f"Saved Rust output to {out_path}"
+        )
         return
 
     logger.error(f"[{file_name}] Final status: {status}")
@@ -313,6 +329,7 @@ def _new_global_metrics() -> dict:
         "final_success": 0,
         "final_failed": 0,
         "final_skipped": 0,
+        "final_evaluated": 0,
         "judge_accepted": 0,
         "judge_failed": 0,
         "judge_skipped": 0,
@@ -333,6 +350,8 @@ def _update_global_metrics(metrics: dict, result: AgentState):
         metrics["final_success"] += 1
     elif status == "skipped":
         metrics["final_skipped"] += 1
+    elif status == "evaluated":
+        metrics["final_evaluated"] = metrics.get("final_evaluated", 0) + 1
     else:
         metrics["final_failed"] += 1
 
@@ -369,7 +388,11 @@ def _update_global_metrics(metrics: dict, result: AgentState):
 
 async def main():
     parser = argparse.ArgumentParser(description="Run the C to Rust translation pipeline.")
-    parser.add_argument("--reset-progress", action="store_true", help="Reset progress and metrics.")
+    parser.add_argument(
+        "--reset-progress",
+        action="store_true",
+        help="Reset progress and metrics.",
+    )
     args = parser.parse_args()
 
     input_dir = "data/processed/input_c_files"
@@ -397,7 +420,10 @@ async def main():
                 data = json.load(f)
                 global_metrics = data.get("metrics", global_metrics)
                 processed_files = set(data.get("processed_files", []))
-            logger.info(f"Loaded progress from {progress_file}. {len(processed_files)} files already processed.")
+            logger.info(
+                f"Loaded progress from {progress_file}. "
+                f"{len(processed_files)} files already processed."
+            )
         except Exception as exc:
             logger.error(f"Failed to load progress file: {exc}")
 

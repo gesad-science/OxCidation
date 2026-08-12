@@ -27,9 +27,12 @@ def _repair_or_stop(
     )
     if repair_count >= max_repairs:
         return {
-            "next_action": "stop_failed",
+            "next_action": "run_judge",
             "failure_category": failure_category,
-            "reason": f"{reason} Max repair attempts reached.",
+            "reason": (
+                f"{reason} Max repair attempts reached; evaluate the final code "
+                "without requesting another repair."
+            ),
             "fix_suggestion": fix_suggestion,
         }
 
@@ -90,9 +93,12 @@ def validate_visible_tests(
 
     if status == "c_failed_compilation":
         return {
-            "next_action": "stop_failed",
-            "failure_category": "compile",
-            "reason": "Original C source failed to compile.",
+            "next_action": "run_judge",
+            "failure_category": "invalid_baseline",
+            "reason": (
+                "The local visible-test C baseline failed to compile; defer to "
+                "the independent Judge environment."
+            ),
             "fix_suggestion": "",
         }
 
@@ -154,9 +160,16 @@ def validate_judge_result(
         }
 
     if status == "SKIPPED":
+        baseline_status = judge_result.get("baseline_status")
+        if baseline_status == "invalid":
+            category = "invalid_baseline"
+        elif baseline_status == "infrastructure_error":
+            category = "infrastructure"
+        else:
+            category = "missing_tests"
         return {
             "next_action": "skip",
-            "failure_category": "missing_tests",
+            "failure_category": category,
             "reason": judge_result.get("details", "Judge tests were skipped."),
             "fix_suggestion": "",
         }

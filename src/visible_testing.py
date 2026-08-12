@@ -11,13 +11,37 @@ from judge_execution import compile_c, compile_rust, list_input_cases
 
 
 PROMPT_PATH = Path("prompts/visible_test_generation_prompt.txt")
+REVIEW_PROMPT_PATH = Path("prompts/visible_test_review_prompt.txt")
 FAILURE_EXAMPLE_LIMIT = 3
+OPERATIONAL_PREPARATION_STATUSES = frozenset(
+    {"generation_failed", "review_failed"}
+)
+REUSABLE_PREPARATION_STATUSES = frozenset(
+    {
+        "ready",
+        "invalid_visible_tests",
+        "review_inconclusive",
+        "baseline_compile_failed",
+    }
+)
 
 
 def load_generation_prompt() -> str:
     prompt = PROMPT_PATH.read_text(encoding="utf-8")
     if "{c_code}" not in prompt:
         raise ValueError(f"Visible-test prompt {PROMPT_PATH} must contain {{c_code}}.")
+    return prompt
+
+
+def load_review_prompt() -> str:
+    prompt = REVIEW_PROMPT_PATH.read_text(encoding="utf-8")
+    required_placeholders = ("{c_code}", "{cases}", "{deterministic_report}")
+    missing = [placeholder for placeholder in required_placeholders if placeholder not in prompt]
+    if missing:
+        raise ValueError(
+            f"Visible-test review prompt {REVIEW_PROMPT_PATH} is missing "
+            f"{', '.join(missing)}."
+        )
     return prompt
 
 
@@ -33,17 +57,49 @@ def find_reusable_suite(
     test_root: str | Path,
     c_code: str,
     generation_prompt: str | None = None,
+    review_prompt: str | None = None,
+    model_provider: str | None = None,
+    model_id: str | None = None,
 ) -> dict | None:
     root = Path(test_root)
     source_hash = source_sha256(c_code)
     generated_dir = root / source_hash[:12]
     manifest = _read_manifest(generated_dir)
     if manifest and manifest.get("source_sha256") == source_hash:
-        expected_prompt_hash = (
-            prompt_sha256(generation_prompt) if generation_prompt is not None else None
+        identities = {
+            "prompt_sha256": (
+                prompt_sha256(generation_prompt) if generation_prompt is not None else None
+            ),
+            "review_prompt_sha256": (
+                prompt_sha256(review_prompt) if review_prompt is not None else None
+            ),
+            "model_provider": model_provider,
+            "model_id": model_id,
+        }
+        matches = all(
+            expected is None or manifest.get(field) == expected
+            for field, expected in identities.items()
         )
-        if expected_prompt_hash is None or manifest.get("prompt_sha256") == expected_prompt_hash:
-            return {**manifest, "suite_dir": str(generated_dir), "reused": True}
+        if matches and manifest.get("status") in REUSABLE_PREPARATION_STATUSES:
+            history_path = generated_dir / "preparation_history.json"
+            if manifest.get("review_prompt_sha256") and not history_path.is_file():
+                return None
+            active_attempt = manifest.get("active_attempt", "")
+            suite_dir = generated_dir / active_attempt if active_attempt else generated_dir
+            if manifest.get("status") == "ready":
+                paired_cases = _paired_cases(suite_dir)
+                if len(paired_cases) != manifest.get("case_count", 0):
+                    return None
+                from visible_test_preparation import suite_sha256
+
+                if suite_sha256(suite_dir) != manifest.get("suite_sha256"):
+                    return None
+            return {
+                **manifest,
+                "suite_dir": str(suite_dir),
+                "preparation_history_path": str(history_path),
+                "reused": True,
+            }
 
     legacy_cases = _paired_cases(root)
     if legacy_cases:
@@ -52,6 +108,8 @@ def find_reusable_suite(
             "source": "preexisting",
             "source_sha256": source_hash,
             "case_count": len(legacy_cases),
+            "review_status": "not_applicable",
+            "generation_attempt_count": 0,
             "suite_dir": str(root),
             "reused": True,
         }
@@ -67,117 +125,38 @@ def materialize_generated_suite(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
 ) -> dict:
+    from visible_test_preparation import materialize_generation_attempt, suite_sha256
+
     source_hash = source_sha256(c_code)
     suite_dir = Path(test_root) / source_hash[:12]
     suite_dir.mkdir(parents=True, exist_ok=True)
-
-    candidates = generation.get("cases", [])
-    generation_record = {
-        "strategy": generation.get("strategy", ""),
-        "cases": candidates,
-        "prompt_sha256": prompt_sha256(generation_prompt),
-    }
-    _write_json(suite_dir / "generation.json", generation_record)
-
-    with tempfile.TemporaryDirectory(prefix="oxcidation-visible-c-") as temp_dir:
-        compilation, c_binary = compile_c(c_code, temp_dir)
-        if compilation.returncode != 0:
-            return _write_suite_manifest(
-                suite_dir,
-                {
-                    "status": "baseline_compile_failed",
-                    "source": "generated",
-                    "source_sha256": source_hash,
-                    "prompt_sha256": generation_record["prompt_sha256"],
-                    "case_count": 0,
-                    "candidate_count": len(candidates),
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "rejected_cases": [],
-                    "details": compilation.stderr,
-                },
-            )
-
-        valid_cases = []
-        rejected_cases = []
-        seen_inputs = set()
-        for candidate_index, candidate in enumerate(candidates, start=1):
-            input_data = candidate.get("input", "")
-            purpose = candidate.get("purpose", "").strip()
-            if input_data in seen_inputs:
-                rejected_cases.append(
-                    _rejected_case(candidate_index, purpose, "duplicate", "Duplicate input.")
-                )
-                continue
-            seen_inputs.add(input_data)
-
-            c_run = run_program(c_binary, input_data, timeout_sec)
-            if c_run["status"] != "ACCEPTED":
-                rejected_cases.append(
-                    _rejected_case(
-                        candidate_index,
-                        purpose,
-                        c_run["status"],
-                        c_run.get("stderr", ""),
-                    )
-                )
-                continue
-
-            case_id = f"case-{len(valid_cases) + 1:03d}"
-            input_file = f"{case_id}.in"
-            output_file = f"{case_id}.out"
-            (suite_dir / input_file).write_text(input_data, encoding="utf-8")
-            (suite_dir / output_file).write_text(c_run["stdout"], encoding="utf-8")
-            valid_cases.append(
-                {
-                    "id": case_id,
-                    "purpose": purpose,
-                    "input_file": input_file,
-                    "output_file": output_file,
-                }
-            )
-
-    status = "ready" if valid_cases else "no_valid_cases"
+    attempt = materialize_generation_attempt(
+        c_code,
+        generation,
+        suite_dir,
+        1,
+        timeout_sec,
+        generation_prompt,
+        "",
+    )
+    attempt.pop("review_cases", None)
+    attempt.pop("suite_dir", None)
     return _write_suite_manifest(
         suite_dir,
         {
-            "status": status,
+            **attempt,
             "source": "generated",
             "source_sha256": source_hash,
-            "prompt_sha256": generation_record["prompt_sha256"],
-            "strategy": generation.get("strategy", ""),
-            "candidate_count": len(candidates),
-            "case_count": len(valid_cases),
+            "review_status": "not_reviewed",
+            "generation_attempt_count": 1,
+            "generated_candidate_count": attempt.get("candidate_count", 0),
+            "rejected_candidate_count": len(attempt.get("rejected_cases", [])),
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "cases": valid_cases,
-            "rejected_cases": rejected_cases,
-            "details": "" if valid_cases else "The C oracle rejected every generated input.",
-        },
-    )
-
-
-def record_generation_failure(
-    c_code: str,
-    test_root: str | Path,
-    generation_prompt: str,
-    details: str,
-) -> dict:
-    source_hash = source_sha256(c_code)
-    suite_dir = Path(test_root) / source_hash[:12]
-    suite_dir.mkdir(parents=True, exist_ok=True)
-    return _write_suite_manifest(
-        suite_dir,
-        {
-            "status": "generation_failed",
-            "source": "generated",
-            "source_sha256": source_hash,
-            "prompt_sha256": prompt_sha256(generation_prompt),
-            "candidate_count": 0,
-            "case_count": 0,
-            "cases": [],
-            "rejected_cases": [],
-            "details": details,
+            "active_attempt": attempt["attempt_path"],
+            "suite_sha256": suite_sha256(
+                suite_dir / attempt["attempt_path"]
+            ),
         },
     )
 
@@ -206,6 +185,16 @@ def evaluate_visible_suite(
             )
             report["failure_category"] = "infrastructure"
             report["reason"] = "The C baseline failed to compile for visible-test execution."
+            report["c_compile_profile"] = getattr(
+                c_compile,
+                "compile_profile",
+                "unknown",
+            )
+            report["c_compile_attempts"] = getattr(
+                c_compile,
+                "compile_attempts",
+                [],
+            )
             return report
 
         rust_compile, rust_binary = compile_rust(rust_code, temp_dir)
@@ -219,6 +208,16 @@ def evaluate_visible_suite(
             )
 
         report = _new_test_report(suite_path, len(input_names))
+        report["c_compile_profile"] = getattr(
+            c_compile,
+            "compile_profile",
+            "unknown",
+        )
+        report["c_compile_attempts"] = getattr(
+            c_compile,
+            "compile_attempts",
+            [],
+        )
         for input_name in input_names:
             _evaluate_case(
                 report,
@@ -392,7 +391,9 @@ def _read_manifest(suite_dir: Path) -> dict | None:
 
 def _write_suite_manifest(suite_dir: Path, manifest: dict) -> dict:
     _write_json(suite_dir / "suite.json", manifest)
-    return {**manifest, "suite_dir": str(suite_dir), "reused": False}
+    active_attempt = manifest.get("active_attempt", "")
+    active_dir = suite_dir / active_attempt if active_attempt else suite_dir
+    return {**manifest, "suite_dir": str(active_dir), "reused": False}
 
 
 def _write_json(path: Path, payload: dict) -> None:

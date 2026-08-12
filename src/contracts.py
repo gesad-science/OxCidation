@@ -5,6 +5,7 @@ PipelineStatus = Literal[
     "success",
     "failed",
     "in_progress",
+    "evaluated",
     "c_failed_compilation",
     "skipped",
 ]
@@ -29,12 +30,15 @@ FailureCategory = Literal[
     "memory",
     "missing_tests",
     "invalid_tests",
+    "inconclusive_tests",
+    "invalid_baseline",
     "infrastructure",
 ]
 
 TestAssessment = Literal[
     "translation_discrepancy",
     "invalid_visible_test",
+    "inconclusive",
 ]
 
 NextAction = Literal[
@@ -84,7 +88,21 @@ class VisibleTestSuite(TypedDict, total=False):
     reused: bool
     prompt_tokens: int
     completion_tokens: int
+    review_prompt_tokens: int
+    review_completion_tokens: int
+    review_status: str
+    generation_attempt_count: int
+    generated_candidate_count: int
+    rejected_candidate_count: int
+    invalid_case_count: int
+    inconclusive_case_count: int
+    unresolved_replacement_count: int
+    suite_sha256: str
+    preparation_history_path: str
+    frozen: bool
     details: str
+    c_compile_profile: str
+    c_compile_attempts: list[dict]
 
 
 class TestReport(TypedDict, total=False):
@@ -140,3 +158,4 @@ class JudgeResult(TypedDict, total=False):
     verdict_counts: dict
     first_failure: dict
     raw_output: str
+    baseline_status: str

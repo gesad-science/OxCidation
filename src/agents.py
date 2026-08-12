@@ -185,7 +185,7 @@ class CodeTranslatorAgent:
                 "translator",
                 "translation",
                 {
-                    "status": status,
+                    "status": "success" if status == "in_progress" else status,
                     "errors": errors,
                     "rust_code": rust_code,
                 },
@@ -240,6 +240,7 @@ class CodeTranslatorAgent:
     async def repair(self, state: AgentState) -> AgentState:
         attempt = state.get("repair_count", 0) + 1
         logger.info(f"[{state['file_name']}] Translator: repair attempt #{attempt}")
+        started_at = time.time()
 
         result = await self.mcp_session.call_tool(
             "repair_rust_code",
@@ -251,7 +252,14 @@ class CodeTranslatorAgent:
             },
         )
 
-        repaired_code = result.content[0].text
+        response_text = result.content[0].text
+        try:
+            payload = json.loads(response_text)
+        except json.JSONDecodeError:
+            payload = {"rust_code": response_text}
+        repaired_code = payload.get("rust_code", "")
+        prompt_tokens = payload.get("prompt_tokens", 0)
+        completion_tokens = payload.get("completion_tokens", 0)
         repair_data = {
             "attempt": attempt,
             "failure_category": state.get("failure_category", "correctness"),
@@ -276,6 +284,13 @@ class CodeTranslatorAgent:
                 repair_data,
                 repair_count=attempt,
             ),
+            "execution_history": _history(
+                state,
+                "repair",
+                started_at,
+                prompt_tokens,
+                completion_tokens,
+            ),
         }
 
 
@@ -290,7 +305,34 @@ class TesterAgent:
         )
         if result.isError:
             raise RuntimeError(result.content[0].text)
-        return json.loads(result.content[0].text)
+        suite = json.loads(result.content[0].text)
+        reference_fields = (
+            "status",
+            "source",
+            "source_sha256",
+            "review_status",
+            "generation_attempt_count",
+            "candidate_count",
+            "generated_candidate_count",
+            "rejected_candidate_count",
+            "invalid_case_count",
+            "inconclusive_case_count",
+            "unresolved_replacement_count",
+            "case_count",
+            "suite_sha256",
+            "suite_dir",
+            "preparation_history_path",
+            "reused",
+            "frozen",
+            "details",
+            "prompt_tokens",
+            "completion_tokens",
+            "review_prompt_tokens",
+            "review_completion_tokens",
+            "c_compile_profile",
+            "c_compile_attempts",
+        )
+        return {field: suite[field] for field in reference_fields if field in suite}
 
     async def run_suite(self, state: AgentState) -> AgentState:
         logger.info(f"[{state['file_name']}] Tester: preparing visible test suite")
@@ -300,15 +342,27 @@ class TesterAgent:
             suite, generation_usage = await self._ensure_suite(state)
             if suite.get("status") != "ready":
                 reason = suite.get("details") or "No valid visible tests were generated."
+                suite_status = suite.get("status")
+                failure_category: FailureCategory
+                if suite_status == "invalid_visible_tests":
+                    failure_category = "invalid_tests"
+                elif suite_status == "review_inconclusive":
+                    failure_category = "inconclusive_tests"
+                elif suite_status == "baseline_compile_failed":
+                    failure_category = "invalid_baseline"
+                elif suite_status in {
+                    "generation_failed",
+                    "review_failed",
+                }:
+                    failure_category = "infrastructure"
+                else:
+                    failure_category = "missing_tests"
                 test_report: TestReport = {
                     "status": "skipped",
                     "suite_dir": suite.get("suite_dir", ""),
                     "total_tests": 0,
-                    "failure_category": (
-                        "infrastructure"
-                        if suite.get("status") in {"generation_failed", "baseline_compile_failed"}
-                        else "missing_tests"
-                    ),
+                    "failure_category": failure_category,
+                    "reason": reason,
                     "details": reason,
                 }
                 status = "skipped"
@@ -400,7 +454,18 @@ class TesterAgent:
                 state,
                 "tester",
                 "visible_test_report",
-                {"test_report": test_report},
+                {
+                    "suite": {
+                        key: suite.get(key, "")
+                        for key in (
+                            "status",
+                            "review_status",
+                            "suite_sha256",
+                            "preparation_history_path",
+                        )
+                    },
+                    "test_report": test_report,
+                },
             ),
             "execution_history": _history(
                 state,
@@ -444,22 +509,28 @@ class CodeValidator:
 
     def from_tests(self, state: AgentState) -> AgentState:
         validator_report = state.get("validator_report", {})
-        if validator_report.get("test_assessment") == "invalid_visible_test":
+        test_report = state.get("test_metrics", {})
+        has_visible_failure = test_report.get("status") == "failed"
+        assessment = validator_report.get("test_assessment")
+        if has_visible_failure and assessment != "translation_discrepancy":
             diagnosis = validator_report.get("diagnosis", "").strip()
+            invalid = assessment == "invalid_visible_test"
             decision: ValidationDecision = {
                 "next_action": "run_judge",
-                "failure_category": "invalid_tests",
+                "failure_category": (
+                    "invalid_tests" if invalid else "inconclusive_tests"
+                ),
                 "reason": (
-                    f"Validator rejected the visible-test evidence: {diagnosis}"
+                    f"Validator did not approve the visible-test evidence: {diagnosis}"
                     if diagnosis
-                    else "Validator rejected the visible-test evidence as invalid."
+                    else "Validator did not confirm a translation discrepancy."
                 ),
                 "fix_suggestion": "",
             }
             return self._decision_result(state, decision, "visible_test_decision")
 
         decision = validate_visible_tests(
-            state.get("test_metrics", {}),
+            test_report,
             state.get("repair_count", 0),
             self.max_repairs,
         )
@@ -506,14 +577,21 @@ class CodeValidator:
             if result.isError:
                 raise RuntimeError(response_text)
             validator_report = json.loads(response_text)
+            prompt_tokens = validator_report.pop("prompt_tokens", 0)
+            completion_tokens = validator_report.pop("completion_tokens", 0)
             validator_report["status"] = "completed"
         except Exception as exc:
             logger.warning(f"[{state['file_name']}] Validator analysis unavailable: {exc}")
             validator_report = {
                 "status": "failed",
+                "test_assessment": "inconclusive",
+                "diagnosis": "The Validator could not establish reliable visible-test evidence.",
+                "repair_guidance": "",
                 "semantic_discrepancies": [],
                 "error": str(exc),
             }
+            prompt_tokens = 0
+            completion_tokens = 0
 
         return {
             "validator_report": validator_report,
@@ -523,7 +601,13 @@ class CodeValidator:
                 "semantic_analysis",
                 {"validator_report": validator_report},
             ),
-            "execution_history": _history(state, "validator_analysis", started_at),
+            "execution_history": _history(
+                state,
+                "validator_analysis",
+                started_at,
+                prompt_tokens,
+                completion_tokens,
+            ),
         }
 
     def from_judge(self, state: AgentState) -> AgentState:
@@ -600,6 +684,10 @@ def _status_after_judge(
 ) -> PipelineStatus:
     if decision["next_action"] == "stop_success":
         return "success"
+    if decision["next_action"] == "stop_evaluated":
+        return "evaluated"
+    if decision["next_action"] == "skip":
+        return "skipped"
     return previous_status
 
 
@@ -682,7 +770,9 @@ class CodeEvaluator:
                     state["c_code"],
                     state.get("rust_code", ""),
                 )
-            return comparison, comparison["rust"]["judge"]
+            judge_result = comparison["rust"]["judge"]
+            judge_result["baseline_status"] = comparison["baseline_status"]
+            return comparison, judge_result
         except Exception as exc:
             judge_result: JudgeResult = {
                 "status": "INFRA_ERROR",
@@ -712,6 +802,7 @@ class CodeEvaluator:
                 "details",
                 "verdict_counts",
                 "first_failure",
+                "baseline_status",
             )
         }
 

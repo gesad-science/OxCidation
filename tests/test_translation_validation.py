@@ -4,10 +4,54 @@ import unittest
 from types import SimpleNamespace
 
 from agents import CodeEvaluator, CodeTranslatorAgent, CodeValidator, TesterAgent
-from orchestrator import compile_node
+from orchestrator import app, compile_node
+from validator import validate_judge_result
 
 
 class TranslationValidationTests(unittest.TestCase):
+    def test_invalid_c_baseline_is_not_reported_as_missing_tests(self):
+        decision = validate_judge_result(
+            {
+                "status": "SKIPPED",
+                "baseline_status": "invalid",
+                "details": "C baseline was not accepted on these Judge cases.",
+            }
+        )
+
+        self.assertEqual(decision["next_action"], "skip")
+        self.assertEqual(decision["failure_category"], "invalid_baseline")
+
+    def test_nonaccepted_judge_result_is_recorded_as_evaluated(self):
+        result = CodeValidator(max_repairs=5).from_judge(
+            {
+                "status": "success",
+                "judge_result": {
+                    "status": "WRONG_ANSWER",
+                    "details": "One Judge case differed.",
+                },
+            }
+        )
+
+        self.assertEqual(result["status"], "evaluated")
+        self.assertEqual(
+            result["validation_decision"]["next_action"],
+            "stop_evaluated",
+        )
+
+    def test_unavailable_judge_result_is_recorded_as_skipped(self):
+        result = CodeValidator(max_repairs=5).from_judge(
+            {
+                "status": "success",
+                "judge_result": {
+                    "status": "SKIPPED",
+                    "details": "No matching Judge cases were found.",
+                },
+            }
+        )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["failure_category"], "missing_tests")
+
     def test_translation_failure_stops_without_repair(self):
         decision = CodeValidator(max_repairs=5).from_translation(
             {"status": "failed", "rust_code": "", "errors": "Provider request failed."}
@@ -31,6 +75,7 @@ class TranslationValidationTests(unittest.TestCase):
             "test_metrics": {"status": "failed", "details": "Output differs."},
             "repair_count": 0,
             "validator_report": {
+                "test_assessment": "translation_discrepancy",
                 "diagnosis": "The row width differs.",
                 "repair_guidance": "Preserve the C printf width of five characters.",
             },
@@ -50,14 +95,79 @@ class TranslationValidationTests(unittest.TestCase):
                 "verdict_counts": {"TIME_LIMIT_EXCEEDED": 1},
             },
             "repair_count": 0,
+            "validator_report": {
+                "test_assessment": "translation_discrepancy",
+                "diagnosis": "The Rust execution times out.",
+                "repair_guidance": "Correct the non-terminating loop.",
+            },
         }
 
         decision = CodeValidator(max_repairs=5).from_tests(state)
 
         self.assertEqual(decision["failure_category"], "timeout")
 
+    def test_exhausted_visible_repairs_continue_to_judge(self):
+        state = {
+            "test_metrics": {
+                "status": "failed",
+                "failed_rust_where_c_passed": 1,
+                "total_tests": 1,
+            },
+            "repair_count": 5,
+            "validator_report": {
+                "test_assessment": "translation_discrepancy",
+                "diagnosis": "Rust output differs.",
+                "repair_guidance": "Preserve the C output.",
+            },
+        }
+
+        decision = CodeValidator(max_repairs=5).from_tests(state)
+
+        self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
+        self.assertIn("Max repair attempts reached", decision["validation_decision"]["reason"])
+
+    def test_exhausted_compile_repairs_continue_to_judge(self):
+        decision = CodeValidator(max_repairs=5).from_compile(
+            {
+                "status": "failed",
+                "errors": "compiler error",
+                "repair_count": 5,
+            }
+        )
+
+        self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
+
+    def test_visible_c_compile_failure_defers_to_judge_environment(self):
+        decision = CodeValidator(max_repairs=5).from_tests(
+            {
+                "test_metrics": {"status": "c_failed_compilation"},
+                "repair_count": 0,
+                "validator_report": {"status": "not_required"},
+            }
+        )
+
+        self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
+        self.assertEqual(decision["failure_category"], "invalid_baseline")
+
     def test_tester_generates_then_executes_one_shared_suite(self):
-        session = _TesterSession()
+        session = _TesterSession(
+            {
+                "status": "ready",
+                "suite_dir": "visible/sample/hash",
+                "case_count": 1,
+                "suite_sha256": "hash",
+                "review_status": "approved",
+                "c_compile_profile": "gnu89-compat",
+                "c_compile_attempts": [
+                    {"profile": "gnu11", "status": "failed"},
+                    {"profile": "gnu89-compat", "status": "success"},
+                ],
+                "review": {"diagnosis": "Do not duplicate this per prompt."},
+                "cases": [{"id": "case-001"}],
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+            }
+        )
         state = {
             "file_name": "sample.c",
             "c_code": "int main(void) { return 0; }",
@@ -68,9 +178,19 @@ class TranslationValidationTests(unittest.TestCase):
 
         result = asyncio.run(TesterAgent(session).run_suite(state))
 
-        self.assertEqual(session.tool_names, ["generate_visible_test_suite", "evaluate_test_cases"])
+        self.assertEqual(
+            session.tool_names,
+            ["generate_visible_test_suite", "evaluate_test_cases"],
+        )
         self.assertEqual(result["test_metrics"]["status"], "success")
         self.assertEqual(result["visible_test_suite"]["suite_dir"], "visible/sample/hash")
+        self.assertEqual(result["visible_test_suite"]["suite_sha256"], "hash")
+        self.assertEqual(
+            result["visible_test_suite"]["c_compile_profile"],
+            "gnu89-compat",
+        )
+        self.assertNotIn("review", result["visible_test_suite"])
+        self.assertNotIn("cases", result["visible_test_suite"])
 
     def test_tester_reuses_a_suite_during_repair(self):
         session = _TesterSession()
@@ -90,6 +210,86 @@ class TranslationValidationTests(unittest.TestCase):
         asyncio.run(TesterAgent(session).run_suite(state))
 
         self.assertEqual(session.tool_names, ["evaluate_test_cases"])
+
+    def test_invalid_prepared_suite_skips_visible_repair(self):
+        session = _TesterSession(
+            {
+                "status": "invalid_visible_tests",
+                "suite_dir": "visible/sample/hash",
+                "case_count": 0,
+                "details": "The replacement suite remained invalid.",
+            }
+        )
+        state = {
+            "file_name": "sample.c",
+            "c_code": "int main(void) { return 0; }",
+            "rust_code": "fn main() {}",
+            "visible_test_root": "visible/sample",
+            "execution_history": [],
+        }
+
+        tested = asyncio.run(TesterAgent(session).run_suite(state))
+        decision = CodeValidator(max_repairs=5).from_tests({**state, **tested})
+
+        self.assertEqual(session.tool_names, ["generate_visible_test_suite"])
+        self.assertEqual(tested["test_metrics"]["failure_category"], "invalid_tests")
+        self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
+
+    def test_inconclusive_prepared_suite_skips_visible_repair(self):
+        session = _TesterSession(
+            {
+                "status": "review_inconclusive",
+                "suite_dir": "visible/sample/hash",
+                "case_count": 0,
+                "details": "The valid range cannot be inferred.",
+            }
+        )
+        state = {
+            "file_name": "sample.c",
+            "c_code": "int main(void) { return 0; }",
+            "rust_code": "fn main() {}",
+            "visible_test_root": "visible/sample",
+            "execution_history": [],
+        }
+
+        tested = asyncio.run(TesterAgent(session).run_suite(state))
+        decision = CodeValidator(max_repairs=5).from_tests({**state, **tested})
+
+        self.assertEqual(tested["test_metrics"]["failure_category"], "inconclusive_tests")
+        self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
+
+    def test_incompatible_c_baseline_is_explicitly_marked_invalid(self):
+        session = _TesterSession(
+            {
+                "status": "baseline_compile_failed",
+                "suite_dir": "visible/sample/hash",
+                "case_count": 0,
+                "c_compile_profile": "",
+                "c_compile_attempts": [
+                    {"profile": "gnu11", "status": "failed"},
+                    {"profile": "gnu89-compat", "status": "failed"},
+                ],
+                "details": "The accepted C source did not compile locally.",
+            }
+        )
+        state = {
+            "file_name": "sample.c",
+            "c_code": "invalid",
+            "rust_code": "fn main() {}",
+            "visible_test_root": "visible/sample",
+            "execution_history": [],
+        }
+
+        tested = asyncio.run(TesterAgent(session).run_suite(state))
+
+        self.assertEqual(
+            tested["test_metrics"]["failure_category"],
+            "invalid_baseline",
+        )
+        self.assertEqual(
+            tested["visible_test_suite"]["status"],
+            "baseline_compile_failed",
+        )
 
     def test_skipped_tester_infrastructure_does_not_request_repair(self):
         decision = CodeValidator(max_repairs=5).from_tests(
@@ -146,7 +346,10 @@ class TranslationValidationTests(unittest.TestCase):
         )
         self.assertNotIn("details", session.arguments["test_report"])
         self.assertNotIn("suite_dir", session.arguments["test_report"])
-        self.assertEqual(result["validator_report"]["repair_guidance"], "Print a newline after the result.")
+        self.assertEqual(
+            result["validator_report"]["repair_guidance"],
+            "Print a newline after the result.",
+        )
 
     def test_validator_skips_analysis_without_differential_failure(self):
         session = _FakeSession({})
@@ -161,6 +364,36 @@ class TranslationValidationTests(unittest.TestCase):
 
         self.assertEqual(result["validator_report"]["status"], "not_required")
         self.assertIsNone(session.tool_name)
+
+    def test_validator_failure_becomes_inconclusive_evidence(self):
+        state = {
+            "file_name": "sample.c",
+            "c_code": "int main(void) { return 0; }",
+            "rust_code": "fn main() {}",
+            "repair_count": 0,
+            "test_metrics": {
+                "status": "failed",
+                "failed_rust_where_c_passed": 1,
+                "failure_examples": [{"case": "case-001.in", "input": "1\n"}],
+            },
+        }
+
+        state.update(
+            asyncio.run(
+                CodeValidator(max_repairs=5).analyze_test_report(
+                    state,
+                    _ErrorSession("Validator provider unavailable."),
+                )
+            )
+        )
+        decision = CodeValidator(max_repairs=5).from_tests(state)
+
+        self.assertEqual(
+            state["validator_report"]["test_assessment"],
+            "inconclusive",
+        )
+        self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
+        self.assertEqual(decision["failure_category"], "inconclusive_tests")
 
     def test_interaction_history_preserves_analysis_after_successful_repair(self):
         validator = CodeValidator(max_repairs=5)
@@ -260,6 +493,66 @@ class TranslationValidationTests(unittest.TestCase):
         self.assertEqual(result["validation_decision"]["next_action"], "run_judge")
         self.assertEqual(result["failure_category"], "invalid_tests")
         self.assertEqual(result["errors"], "")
+
+    def test_inconclusive_visible_evidence_does_not_trigger_repair(self):
+        state = {
+            "test_metrics": {
+                "status": "failed",
+                "failed_rust_where_c_passed": 1,
+                "total_tests": 1,
+            },
+            "validator_report": {
+                "status": "completed",
+                "test_assessment": "inconclusive",
+                "diagnosis": "The valid input range cannot be inferred from the source.",
+                "repair_guidance": "",
+            },
+            "repair_count": 0,
+        }
+
+        result = CodeValidator(max_repairs=5).from_tests(state)
+
+        self.assertEqual(result["validation_decision"]["next_action"], "run_judge")
+        self.assertEqual(result["failure_category"], "inconclusive_tests")
+        self.assertEqual(result["errors"], "")
+
+    def test_graph_exposes_visible_validation_routes(self):
+        edges = {
+            (edge.source, edge.target, edge.data)
+            for edge in app.get_graph().edges
+        }
+
+        self.assertIn(
+            ("validate_visible_node", "judge_node", "run_judge"),
+            edges,
+        )
+        self.assertIn(
+            ("validate_visible_node", "repair_node", "repair_translation"),
+            edges,
+        )
+        self.assertIn(
+            ("validate_compile_node", "judge_node", "run_judge"),
+            edges,
+        )
+
+    def test_graph_exposes_terminal_judge_routes_for_repair_limits(self):
+        edges = {
+            (edge.source, edge.target, edge.data)
+            for edge in app.get_graph().edges
+        }
+
+        self.assertIn(
+            ("validate_compile_node", "judge_node", "run_judge"),
+            edges,
+        )
+        self.assertIn(
+            ("validate_visible_node", "judge_node", "run_judge"),
+            edges,
+        )
+        self.assertIn(
+            ("judge_node", "validate_judge_node", None),
+            edges,
+        )
 
     def test_compile_repair_references_compiler_event_without_copying_it(self):
         session = _RepairSession()
@@ -440,6 +733,17 @@ class _FakeJudgeComparison:
         }
 
 
+class _ErrorSession:
+    def __init__(self, message):
+        self.message = message
+
+    async def call_tool(self, tool_name, arguments):
+        return SimpleNamespace(
+            content=[SimpleNamespace(text=self.message)],
+            isError=True,
+        )
+
+
 class _RepairSession:
     def __init__(self):
         self.arguments = None
@@ -447,7 +751,17 @@ class _RepairSession:
     async def call_tool(self, tool_name, arguments):
         self.arguments = arguments
         return SimpleNamespace(
-            content=[SimpleNamespace(text="fn main() {}")],
+            content=[
+                SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "rust_code": "fn main() {}",
+                            "prompt_tokens": 11,
+                            "completion_tokens": 6,
+                        }
+                    )
+                )
+            ],
             isError=False,
         )
 
@@ -483,13 +797,14 @@ class _PipelineSession:
 
 
 class _TesterSession:
-    def __init__(self):
+    def __init__(self, suite_payload=None):
         self.tool_names = []
+        self.suite_payload = suite_payload
 
     async def call_tool(self, tool_name, arguments):
         self.tool_names.append(tool_name)
         if tool_name == "generate_visible_test_suite":
-            payload = {
+            payload = self.suite_payload or {
                 "status": "ready",
                 "suite_dir": "visible/sample/hash",
                 "case_count": 1,

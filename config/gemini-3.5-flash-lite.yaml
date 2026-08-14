@@ -1,0 +1,8 @@
+# Gemini mini-test profile. Set OXCIDATION_CONFIG_FILE to this path.
+provider: gemini
+model: gemini-3.5-flash-lite
+request_rate_limit_rpm: 15
+max_repair_attempts: 5
+judge_backend: auto
+visible_test_time_limit_sec: 5
+judge_compare_mode: ignore-spaces-and-newlines

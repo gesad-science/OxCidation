@@ -12,6 +12,8 @@ from benchmark import (
     filter_judge_eligible_sources,
     load_sources,
     prepare_visible_suite,
+    resolve_dataset_paths,
+    select_prompts,
     select_sources,
     server_environment,
 )
@@ -24,6 +26,62 @@ from benchmark_reporting import (
 
 
 class BenchmarkSelectionTests(unittest.TestCase):
+    def test_selects_only_requested_prompt_ids(self):
+        prompts = [
+            Prompt("direct", "{c_code}", "direct-hash"),
+            Prompt("research", "{c_code}", "research-hash"),
+        ]
+
+        self.assertEqual(
+            select_prompts(prompts, ["research"]),
+            [prompts[1]],
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown prompt IDs: missing"):
+            select_prompts(prompts, ["missing"])
+
+    def test_dataset_root_resolves_the_standard_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "data").mkdir()
+            (root / "metadata").mkdir()
+            (root / "judge_tests").mkdir()
+            manifest = root / "manifests" / "aoj_problem_mapping"
+            manifest.mkdir(parents=True)
+            (manifest / "benchmark_population.csv").write_text(
+                "problem_id,source_file\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                dataset_root=str(root),
+                input_dir=None,
+                source_manifest=None,
+                judge_tests_root=None,
+                metadata_root=None,
+            )
+
+            paths = resolve_dataset_paths(args)
+
+            self.assertEqual(paths.input_dir, root / "data")
+            self.assertEqual(paths.metadata_root, root / "metadata")
+            self.assertEqual(paths.judge_tests_root, root / "judge_tests")
+            self.assertEqual(
+                paths.source_manifest,
+                manifest / "benchmark_population.csv",
+            )
+
+    def test_dataset_root_rejects_an_incomplete_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = SimpleNamespace(
+                dataset_root=temp_dir,
+                input_dir=None,
+                source_manifest=None,
+                judge_tests_root=None,
+                metadata_root=None,
+            )
+
+            with self.assertRaisesRegex(ValueError, "Invalid --dataset-root layout"):
+                resolve_dataset_paths(args)
+
     def test_manifest_rejects_multiple_programs_for_one_problem(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

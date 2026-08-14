@@ -43,6 +43,11 @@ from visible_testing import OPERATIONAL_PREPARATION_STATUSES
 
 LOGGER = logging.getLogger(__name__)
 PROMPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+DEFAULT_INPUT_DIR = Path("data/processed/input_c_files")
+DATASET_SOURCE_DIR = Path("data")
+DATASET_METADATA_DIR = Path("metadata")
+DATASET_MANIFEST_PATH = Path("manifests/aoj_problem_mapping/benchmark_population.csv")
+DATASET_JUDGE_TESTS_DIR = Path("judge_tests")
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,14 @@ class Prompt:
 class SourceProgram:
     problem_id: str
     path: Path
+
+
+@dataclass(frozen=True)
+class DatasetPaths:
+    input_dir: Path
+    source_manifest: Path | None
+    judge_tests_root: Path | None
+    metadata_root: Path | None
 
 
 def load_prompts(prompt_dir: Path) -> list[Prompt]:
@@ -78,6 +91,18 @@ def load_prompts(prompt_dir: Path) -> list[Prompt]:
             )
         )
     return prompts
+
+
+def select_prompts(prompts: list[Prompt], prompt_ids: list[str] | None) -> list[Prompt]:
+    if not prompt_ids:
+        return prompts
+
+    requested = set(prompt_ids)
+    available = {prompt.prompt_id for prompt in prompts}
+    unknown = sorted(requested - available)
+    if unknown:
+        raise ValueError(f"Unknown prompt IDs: {', '.join(unknown)}.")
+    return [prompt for prompt in prompts if prompt.prompt_id in requested]
 
 
 def load_sources(input_dir: Path, source_manifest: Path | None) -> list[SourceProgram]:
@@ -128,6 +153,56 @@ def filter_judge_eligible_sources(
     ]
 
 
+def resolve_dataset_paths(args: argparse.Namespace) -> DatasetPaths:
+    if not args.dataset_root:
+        return DatasetPaths(
+            input_dir=Path(args.input_dir) if args.input_dir else DEFAULT_INPUT_DIR,
+            source_manifest=(
+                Path(args.source_manifest) if args.source_manifest else None
+            ),
+            judge_tests_root=(
+                Path(args.judge_tests_root) if args.judge_tests_root else None
+            ),
+            metadata_root=Path(args.metadata_root) if args.metadata_root else None,
+        )
+
+    root = Path(args.dataset_root)
+    paths = DatasetPaths(
+        input_dir=Path(args.input_dir) if args.input_dir else root / DATASET_SOURCE_DIR,
+        source_manifest=(
+            Path(args.source_manifest)
+            if args.source_manifest
+            else root / DATASET_MANIFEST_PATH
+        ),
+        judge_tests_root=(
+            Path(args.judge_tests_root)
+            if args.judge_tests_root
+            else root / DATASET_JUDGE_TESTS_DIR
+        ),
+        metadata_root=(
+            Path(args.metadata_root)
+            if args.metadata_root
+            else root / DATASET_METADATA_DIR
+        ),
+    )
+    expected_paths = {
+        "C sources": paths.input_dir,
+        "source manifest": paths.source_manifest,
+        "Judge tests": paths.judge_tests_root,
+        "metadata": paths.metadata_root,
+    }
+    missing = [
+        f"{label} ({path})"
+        for label, path in expected_paths.items()
+        if path is not None and not path.exists()
+    ]
+    if missing:
+        raise ValueError(
+            "Invalid --dataset-root layout; missing " + ", ".join(missing) + "."
+        )
+    return paths
+
+
 def server_environment(configs: ConfigDetails) -> dict[str, str]:
     environment = os.environ.copy()
     environment["OXCIDATION_CONFIG_FILE"] = str(Path(configs.config_file).resolve())
@@ -158,15 +233,22 @@ async def prepare_visible_suite(
     return suite
 
 
-def build_judge_comparison(args: argparse.Namespace, configs: ConfigDetails) -> JudgeComparison | None:
-    configured_values = (args.judge_tests_root, args.metadata_root)
+def build_judge_comparison(
+    dataset_paths: DatasetPaths,
+    args: argparse.Namespace,
+    configs: ConfigDetails,
+) -> JudgeComparison | None:
+    configured_values = (
+        dataset_paths.judge_tests_root,
+        dataset_paths.metadata_root,
+    )
     if not any(configured_values):
         return None
     if not all(configured_values):
         raise ValueError("--judge-tests-root and --metadata-root must be provided together.")
     profile = JudgeProfile(
-        tests_root=Path(args.judge_tests_root),
-        metadata_root=Path(args.metadata_root),
+        tests_root=dataset_paths.judge_tests_root,
+        metadata_root=dataset_paths.metadata_root,
         runtime=args.judge_runtime,
         c_image=args.c_judge_image,
         rust_image=args.rust_judge_image,
@@ -211,14 +293,15 @@ def _finalize_reports(experiment_dir: Path, rows: list[dict]) -> None:
 
 
 async def run_benchmark(args: argparse.Namespace) -> None:
-    input_dir = Path(args.input_dir)
+    dataset_paths = resolve_dataset_paths(args)
+    input_dir = dataset_paths.input_dir
     prompt_dir = Path(args.prompts_dir)
     root_dir = Path(args.output_root)
-    prompts = load_prompts(prompt_dir)
-    source_manifest = Path(args.source_manifest) if args.source_manifest else None
+    prompts = select_prompts(load_prompts(prompt_dir), args.prompt_id)
+    source_manifest = dataset_paths.source_manifest
     population = load_sources(input_dir, source_manifest)
     configs = ConfigDetails()
-    judge_comparison = build_judge_comparison(args, configs)
+    judge_comparison = build_judge_comparison(dataset_paths, args, configs)
     if judge_comparison is not None:
         population = filter_judge_eligible_sources(population, judge_comparison)
         LOGGER.info(
@@ -422,12 +505,24 @@ async def run_benchmark(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an isolated prompt benchmark.")
     parser.add_argument("--experiment-id", required=True)
-    parser.add_argument("--input-dir", default="data/processed/input_c_files")
+    parser.add_argument(
+        "--dataset-root",
+        help=(
+            "Dataset root containing data/, metadata/, "
+            "manifests/aoj_problem_mapping/benchmark_population.csv, and judge_tests/."
+        ),
+    )
+    parser.add_argument("--input-dir")
     parser.add_argument(
         "--source-manifest",
         help="CSV with problem_id and source_file, required for one-program-per-problem sampling.",
     )
     parser.add_argument("--prompts-dir", default="prompts/benchmark")
+    parser.add_argument(
+        "--prompt-id",
+        action="append",
+        help="Run only this prompt ID. Repeat to select multiple prompts.",
+    )
     parser.add_argument("--output-root", default="outputs")
     parser.add_argument("--sample-size", type=int, default=324)
     parser.add_argument("--seed", type=int, default=42)

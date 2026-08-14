@@ -29,6 +29,7 @@ Read according to the question you are trying to answer:
 | What must still be decided? | [Open decisions](06-open-decisions.md) |
 | What instructions are sent to the agents' LLM? | [Agent prompts](07-agent-prompts.md) |
 | Which unexpected cases have already been observed? | [Unexpected smoke-test cases](10-unexpected-smoke-test-cases.md) |
+| How do I run the benchmark or main experiment? | [Running benchmarks and experiments](11-running-experiments.md) |
 | What happens to one program in the main experiment? | [Simplified main experiment flow](09-experiment-agent-flow-simple.md) |
 | How does the prompt-selection benchmark work in detail? | [Detailed benchmark flow](08-experiment-agent-flow.md) |
 

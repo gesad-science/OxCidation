@@ -30,12 +30,13 @@ The environment variable `OXCIDATION_CONFIG_FILE` selects the active model confi
 
 ### Gemini
 
-The repository includes two Gemini profiles:
+The repository includes three Gemini profiles:
 
 - `config/gemini-3.1-flash-lite.yaml`
+- `config/gemini-3.5-flash-lite.yaml`
 - `config/gemma-4-31b-it.yaml`
 
-Both profiles pace all LLM requests at 15 RPM, including visible-test generation, translation, semantic validation, and repair. Export `GEMINI_API_KEY` for the command that launches the benchmark.
+All three profiles pace LLM requests at 15 RPM, including visible-test generation, translation, semantic validation, and repair. Export `GEMINI_API_KEY` for the command that launches the benchmark.
 
 ```bash
 GEMINI_API_KEY="..." \
@@ -78,7 +79,7 @@ Use `extract_accepted_codenet.py` when starting from the full compressed Project
 ```bash
 ./.venv/bin/python extract_accepted_codenet.py \
   --archive /path/to/CodeNet/Project_CodeNet.tar.gz \
-  --output /path/to/CodeNet/Project_CodeNet_C_Accepted
+  --output /path/to/OxCidation_dataset
 ```
 
 The extractor reads the archive twice. The first pass reads metadata and identifies every row with `language=C`, `status=Accepted`, and `filename_ext=c`. The second pass scans the archive once, extracts the C section and supporting data, and removes every C source not present in the accepted-submission set. The final subset contains no rejected C submissions or other programming languages.
@@ -88,7 +89,7 @@ Because a compressed tar archive has no random-access index, the second pass mus
 The output preserves the relevant CodeNet layout:
 
 ```text
-Project_CodeNet_C_Accepted/
+OxCidation_dataset/
   data/<problem_id>/C/<submission_id>.c
   metadata/<problem_id>.csv
   metadata/problem_list.csv
@@ -112,16 +113,16 @@ Run `prepare_benchmark_population.py` after extraction when constructing the one
 
 ```bash
 ./.venv/bin/python prepare_benchmark_population.py \
-  --data-root /path/to/CodeNet/Project_CodeNet_C_Accepted/data \
-  --metadata-root /path/to/CodeNet/Project_CodeNet_C_Accepted/metadata \
-  --output data/processed/benchmark_population.csv \
+  --data-root /path/to/OxCidation_dataset/data \
+  --metadata-root /path/to/OxCidation_dataset/metadata \
+  --output /path/to/OxCidation_dataset/manifests/benchmark_population.csv \
   --selection-seed 42
 ```
 
 This does not extract the dataset. It selects one verified `Accepted` C submission per problem from the complete subset and writes:
 
-- `data/processed/benchmark_population.csv`: the population manifest used by `src/benchmark.py`.
-- `data/processed/benchmark_population.summary.json`: selection policy, seed, population size, and skipped-problem counts.
+- `manifests/benchmark_population.csv`: the source population used to prepare the AOJ mapping.
+- `manifests/benchmark_population.summary.json`: selection policy, seed, population size, and skipped-problem counts.
 
 Use `--require-rust-accepted` only when reproducing the historical Gold Standard intersection in which each problem also has an accepted Rust submission:
 
@@ -143,10 +144,10 @@ served by AOJ:
 
 ```bash
 ./.venv/bin/python prepare_aoj_problem_mapping.py \
-  --problem-manifest /path/to/CodeNet/Project_CodeNet_C_Accepted/manifests/problems.csv \
-  --descriptions-root /path/to/CodeNet/Project_CodeNet_C_Accepted/problem_descriptions \
-  --source-manifest data/processed/benchmark_population.csv \
-  --output-root data/processed/aoj_problem_mapping
+  --problem-manifest /path/to/OxCidation_dataset/manifests/problems.csv \
+  --descriptions-root /path/to/OxCidation_dataset/problem_descriptions \
+  --source-manifest /path/to/OxCidation_dataset/manifests/benchmark_population.csv \
+  --output-root /path/to/OxCidation_dataset/manifests/aoj_problem_mapping
 ```
 
 Only problems from the accepted-C manifest are considered. AtCoder rows are
@@ -175,8 +176,8 @@ Use `prepare_aoj_system_tests.py` with the verified mapping manifest:
 
 ```bash
 ./.venv/bin/python prepare_aoj_system_tests.py \
-  --problem-manifest data/processed/aoj_problem_mapping/mapped_problems.csv \
-  --output-root /path/to/CodeNet/aoj_system_tests_mapped
+  --problem-manifest /path/to/OxCidation_dataset/manifests/aoj_problem_mapping/mapped_problems.csv \
+  --output-root /path/to/OxCidation_dataset/judge_tests
 ```
 
 The downloader receives an explicit `aoj_problem_id` for every CodeNet
@@ -192,9 +193,9 @@ Retry only rows still classified as `failed` with:
 
 ```bash
 ./.venv/bin/python prepare_aoj_system_tests.py \
-  --problem-manifest data/processed/aoj_problem_mapping/mapped_problems.csv \
-  --output-root /path/to/CodeNet/aoj_system_tests_mapped \
-  --retry-failed-from /path/to/CodeNet/aoj_system_tests_mapped/prefetch_results.csv
+  --problem-manifest /path/to/OxCidation_dataset/manifests/aoj_problem_mapping/mapped_problems.csv \
+  --output-root /path/to/OxCidation_dataset/judge_tests \
+  --retry-failed-from /path/to/OxCidation_dataset/judge_tests/prefetch_results.csv
 ```
 
 The targeted retry merges its results into the existing complete report. AOJ headers that explicitly declare unavailable content are recorded as `unavailable`, not repeatedly treated as network failures. A one-byte excess caused by a returned terminal newline is accepted and recorded in the suite manifest; other size discrepancies remain failures for investigation.
@@ -203,8 +204,8 @@ For a small live check before starting the full population:
 
 ```bash
 ./.venv/bin/python prepare_aoj_system_tests.py \
-  --problem-manifest data/processed/aoj_problem_mapping/mapped_problems.csv \
-  --output-root /path/to/CodeNet/aoj_system_tests_mapped \
+  --problem-manifest /path/to/OxCidation_dataset/manifests/aoj_problem_mapping/mapped_problems.csv \
+  --output-root /path/to/OxCidation_dataset/judge_tests \
   --limit 5
 ```
 
@@ -221,6 +222,13 @@ Point the benchmark's `--judge-tests-root` option at this output root. AOJ cases
 
 Use this command when comparing translation prompts for one selected model. `--experiment-id` must be new, except for an empty directory left by an early configuration failure.
 
+For the standard accepted-C dataset layout, pass one `--dataset-root` instead
+of individual source, manifest, metadata, and Judge-case paths. The directory
+must contain `data/`, `metadata/`,
+`manifests/aoj_problem_mapping/benchmark_population.csv`, and `judge_tests/`.
+See [`docs-shared/11-running-experiments.md`](docs-shared/11-running-experiments.md)
+for the benchmark, main-experiment, and resume workflows.
+
 When Judge options are provided, sampling is restricted to programs with
 problem limits in the metadata and at least one matched Judge input/output
 pair. The seed is applied after this eligibility filter. Without Judge options,
@@ -233,13 +241,9 @@ GEMINI_API_KEY="..." \
 OXCIDATION_CONFIG_FILE=config/gemini-3.1-flash-lite.yaml \
 ./.venv/bin/python src/benchmark.py \
   --experiment-id gemini-flash-lite-smoke-08 \
-  --input-dir /path/to/CodeNet/Project_CodeNet_C_Accepted/data \
-  --source-manifest data/processed/aoj_problem_mapping/benchmark_population.csv \
-  --prompts-dir prompts/benchmark \
+  --dataset-root /path/to/OxCidation_dataset \
   --sample-size 20 \
-  --seed 42 \
-  --judge-tests-root /path/to/CodeNet/aoj_system_tests_mapped \
-  --metadata-root /path/to/CodeNet/Project_CodeNet_C_Accepted/metadata
+  --seed 42
 ```
 
 ### OpenAI benchmark with integrated Judge
@@ -249,13 +253,9 @@ OPENAI_API_KEY="..." \
 OXCIDATION_CONFIG_FILE=config/openai-benchmark.yaml \
 ./.venv/bin/python src/benchmark.py \
   --experiment-id openai-smoke-01 \
-  --input-dir /path/to/CodeNet/Project_CodeNet_C_Accepted/data \
-  --source-manifest data/processed/aoj_problem_mapping/benchmark_population.csv \
-  --prompts-dir prompts/benchmark \
+  --dataset-root /path/to/OxCidation_dataset \
   --sample-size 20 \
-  --seed 42 \
-  --judge-tests-root /path/to/CodeNet/aoj_system_tests_mapped \
-  --metadata-root /path/to/CodeNet/Project_CodeNet_C_Accepted/metadata
+  --seed 42
 ```
 
 The benchmark first asks the configured model to generate concrete standard-input cases from each C source. The model chooses the suite size and never receives the problem statement or Judge cases. Each candidate is executed twice against the accepted C program; duplicate, failing, timed-out, or unstable candidates are rejected deterministically.
@@ -314,13 +314,9 @@ GEMINI_API_KEY="..." \
 OXCIDATION_CONFIG_FILE=config/gemini-3.1-flash-lite.yaml \
 ./.venv/bin/python src/benchmark.py \
   --experiment-id gemini-flash-lite-smoke-08 \
-  --input-dir /path/to/CodeNet/Project_CodeNet_C_Accepted/data \
-  --source-manifest data/processed/aoj_problem_mapping/benchmark_population.csv \
-  --prompts-dir prompts/benchmark \
+  --dataset-root /path/to/OxCidation_dataset \
   --sample-size 20 \
   --seed 42 \
-  --judge-tests-root /path/to/CodeNet/aoj_system_tests_mapped \
-  --metadata-root /path/to/CodeNet/Project_CodeNet_C_Accepted/metadata \
   --resume
 ```
 
@@ -348,8 +344,8 @@ GEMINI_API_KEY="..." \
 OXCIDATION_CONFIG_FILE=config/gemini-3.1-flash-lite.yaml \
 ./.venv/bin/python src/benchmark.py \
   --experiment-id gemini-translation-only-01 \
-  --input-dir /path/to/CodeNet/Project_CodeNet/data \
-  --source-manifest data/processed/benchmark_population.csv \
+  --input-dir /path/to/OxCidation_dataset/data \
+  --source-manifest /path/to/OxCidation_dataset/manifests/aoj_problem_mapping/benchmark_population.csv \
   --prompts-dir prompts/benchmark \
   --sample-size 20 \
   --seed 42

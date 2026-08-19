@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from judge_execution import (
+    C_COMPILER_PROFILES,
     compile_c,
     compile_rust,
     judge_result,
@@ -36,6 +37,22 @@ class JudgeProfile:
     compare_mode: str = "ignore-spaces-and-newlines"
 
 
+@dataclass(frozen=True)
+class ProgramCompilation:
+    compiler_output: str
+    executable: Path | None
+    profile: str
+    attempts: list[dict]
+
+
+@dataclass(frozen=True)
+class JudgeTarget:
+    test_directory: Path
+    report_directory: Path
+    test_layout: str
+    limits: ProblemLimits
+
+
 class JudgeComparison:
     def __init__(self, profile: JudgeProfile):
         self.profile = profile
@@ -48,42 +65,84 @@ class JudgeComparison:
         c_code: str,
         rust_code: str,
     ) -> dict:
-        limits = self._limits.get(problem_id)
-        if limits is None:
-            return self._skipped_comparison("Problem limits are missing from metadata.")
-
         with tempfile.TemporaryDirectory(prefix="oxcidation-normalized-judge-") as temp_dir:
-            test_directory, test_layout = resolve_test_directory(
-                self.profile.tests_root,
+            target, missing_reason = self._resolve_target(
                 snippet_id,
                 problem_id,
                 Path(temp_dir),
             )
-            if test_directory is None:
-                return self._skipped_comparison("No matching Judge cases were found.")
+            if target is None:
+                return self._skipped_comparison(missing_reason)
 
-            report_key = problem_id
-            if test_layout == "io-directory" and (self.profile.tests_root / snippet_id).is_dir():
-                report_key = snippet_id
-            report_directory = self.profile.tests_root / report_key
-            c_result = evaluate_program("c", c_code, test_directory, limits, self.profile)
+            c_result = evaluate_program(
+                "c",
+                c_code,
+                target.test_directory,
+                target.limits,
+                self.profile,
+            )
+            baseline_status = baseline_status_for(c_result)
             if c_result["judge"]["status"] != "ACCEPTED":
                 return {
-                    "baseline_status": "invalid",
-                    "test_directory": str(report_directory),
-                    "test_layout": test_layout,
-                    "limits": limits.__dict__,
+                    "baseline_status": baseline_status,
+                    "test_directory": str(target.report_directory),
+                    "test_layout": target.test_layout,
+                    "limits": target.limits.__dict__,
                     "c": c_result,
                     "rust": skipped_program("C baseline was not accepted on these Judge cases."),
                 }
 
             return {
                 "baseline_status": "valid",
-                "test_directory": str(report_directory),
-                "test_layout": test_layout,
-                "limits": limits.__dict__,
+                "test_directory": str(target.report_directory),
+                "test_layout": target.test_layout,
+                "limits": target.limits.__dict__,
                 "c": c_result,
-                "rust": evaluate_program("rust", rust_code, test_directory, limits, self.profile),
+                "rust": evaluate_program(
+                    "rust",
+                    rust_code,
+                    target.test_directory,
+                    target.limits,
+                    self.profile,
+                ),
+            }
+
+    def evaluate_c_baseline(
+        self,
+        snippet_id: str,
+        problem_id: str,
+        c_code: str,
+    ) -> dict:
+        """Evaluate one C baseline without invoking the Rust translation flow."""
+        with tempfile.TemporaryDirectory(prefix="oxcidation-normalized-judge-") as temp_dir:
+            target, missing_reason = self._resolve_target(
+                snippet_id,
+                problem_id,
+                Path(temp_dir),
+            )
+            if target is None:
+                skipped = skipped_program(missing_reason)
+                return {
+                    "baseline_status": "missing",
+                    "test_directory": "",
+                    "test_layout": "missing",
+                    "limits": {},
+                    "c": skipped,
+                }
+
+            c_result = evaluate_program(
+                "c",
+                c_code,
+                target.test_directory,
+                target.limits,
+                self.profile,
+            )
+            return {
+                "baseline_status": baseline_status_for(c_result),
+                "test_directory": str(target.report_directory),
+                "test_layout": target.test_layout,
+                "limits": target.limits.__dict__,
+                "c": c_result,
             }
 
     def can_evaluate(self, snippet_id: str, problem_id: str) -> bool:
@@ -91,6 +150,39 @@ class JudgeComparison:
             self.profile.tests_root,
             snippet_id,
             problem_id,
+        )
+
+    def _resolve_target(
+        self,
+        snippet_id: str,
+        problem_id: str,
+        temporary_root: Path,
+    ) -> tuple[JudgeTarget | None, str]:
+        limits = self._limits.get(problem_id)
+        if limits is None:
+            return None, "Problem limits are missing from metadata."
+
+        test_directory, test_layout = resolve_test_directory(
+            self.profile.tests_root,
+            snippet_id,
+            problem_id,
+            temporary_root,
+        )
+        if test_directory is None:
+            return None, "No matching Judge cases were found."
+
+        report_key = problem_id
+        snippet_directory = self.profile.tests_root / snippet_id
+        if test_layout == "io-directory" and snippet_directory.is_dir():
+            report_key = snippet_id
+        return (
+            JudgeTarget(
+                test_directory=test_directory,
+                report_directory=self.profile.tests_root / report_key,
+                test_layout=test_layout,
+                limits=limits,
+            ),
+            "",
         )
 
     @staticmethod
@@ -166,8 +258,18 @@ def skipped_program(reason: str) -> dict:
     return {
         "compile_status": "not_run",
         "compiler_output": "",
+        "compile_profile": "",
+        "compile_attempts": [],
         "judge": judge_result("SKIPPED", 0, 0, 0, 0, reason),
     }
+
+
+def baseline_status_for(c_result: dict) -> str:
+    if c_result["judge"]["status"] == "ACCEPTED":
+        return "valid"
+    if c_result["judge"]["status"] == "INFRA_ERROR":
+        return "infrastructure_error"
+    return "invalid"
 
 
 def evaluate_program(
@@ -178,13 +280,22 @@ def evaluate_program(
     profile: JudgeProfile,
 ) -> dict:
     with tempfile.TemporaryDirectory(prefix="oxcidation-judge-program-") as temp_dir:
-        compiler_output, executable = compile_program(language, source_code, Path(temp_dir), profile)
-        if executable is None:
+        compilation = compile_program(language, source_code, Path(temp_dir), profile)
+        if compilation.executable is None:
             total = len(list_input_cases(str(test_directory)))
             return {
                 "compile_status": "failed",
-                "compiler_output": compiler_output,
-                "judge": judge_result("COMPILATION_ERROR", 0, total, total, 0, compiler_output),
+                "compiler_output": compilation.compiler_output,
+                "compile_profile": compilation.profile,
+                "compile_attempts": compilation.attempts,
+                "judge": judge_result(
+                    "COMPILATION_ERROR",
+                    0,
+                    total,
+                    total,
+                    0,
+                    compilation.compiler_output,
+                ),
             }
 
         container_id = start_execution_container(
@@ -196,7 +307,9 @@ def evaluate_program(
         if container_id is None:
             return {
                 "compile_status": "success",
-                "compiler_output": compiler_output,
+                "compiler_output": compilation.compiler_output,
+                "compile_profile": compilation.profile,
+                "compile_attempts": compilation.attempts,
                 "judge": judge_result(
                     "INFRA_ERROR",
                     0,
@@ -207,7 +320,7 @@ def evaluate_program(
                 ),
             }
         try:
-            command = execution_command(executable, profile, container_id)
+            command = execution_command(compilation.executable, profile, container_id)
             suite_result = run_judge_suite(
                 test_directory,
                 command,
@@ -218,7 +331,9 @@ def evaluate_program(
             stop_execution_container(container_id, profile)
         return {
             "compile_status": "success",
-            "compiler_output": compiler_output,
+            "compiler_output": compilation.compiler_output,
+            "compile_profile": compilation.profile,
+            "compile_attempts": compilation.attempts,
             "judge": suite_result,
         }
 
@@ -228,14 +343,34 @@ def compile_program(
     source_code: str,
     work_dir: Path,
     profile: JudgeProfile,
-) -> tuple[str, Path | None]:
+) -> ProgramCompilation:
     if profile.runtime == "local":
         result, executable = (
             compile_c(source_code, str(work_dir))
             if language == "c"
             else compile_rust(source_code, str(work_dir))
         )
-        return result.stderr, Path(executable) if result.returncode == 0 else None
+        compile_profile = getattr(
+            result,
+            "compile_profile",
+            "rustc" if language == "rust" and result.returncode == 0 else "",
+        )
+        compile_attempts = getattr(
+            result,
+            "compile_attempts",
+            [
+                {
+                    "profile": "rustc",
+                    "status": "success" if result.returncode == 0 else "failed",
+                }
+            ],
+        )
+        return ProgramCompilation(
+            compiler_output=result.stderr,
+            executable=Path(executable) if result.returncode == 0 else None,
+            profile=compile_profile,
+            attempts=compile_attempts,
+        )
 
     source_name = "source.c" if language == "c" else "source.rs"
     executable_name = f"program-{language}"
@@ -244,31 +379,76 @@ def compile_program(
     source_path.write_text(source_code, encoding="utf-8")
     os.chmod(source_path, 0o644)
     image = profile.c_image if language == "c" else profile.rust_image
-    compiler = [
-        "gcc",
-        "-O2",
-        "-pipe",
-        f"/work/{source_name}",
-        "-o",
-        f"/work/{executable_name}",
-        "-lm",
-    ]
-    if language == "rust":
-        compiler = ["rustc", "-O", f"/work/{source_name}", "-o", f"/work/{executable_name}"]
-    command = [
-        profile.runtime,
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "-v",
-        f"{work_dir}:/work:Z",
-        image,
-        *compiler,
-    ]
-    result = subprocess.run(command, capture_output=True, text=True)
     executable = work_dir / executable_name
-    return result.stderr, executable if result.returncode == 0 and executable.is_file() else None
+    compiler_profiles = _container_compiler_profiles(language, source_name, executable_name)
+    attempts = []
+    outputs = []
+    successful_profile = ""
+
+    for compile_profile, compiler in compiler_profiles:
+        command = [
+            profile.runtime,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "-v",
+            f"{work_dir}:/work:Z",
+            image,
+            *compiler,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        status = "success" if result.returncode == 0 and executable.is_file() else "failed"
+        attempts.append({"profile": compile_profile, "status": status})
+        if result.stderr:
+            outputs.append(f"[{compile_profile}]\n{result.stderr}")
+        if status == "success":
+            successful_profile = compile_profile
+            break
+
+    return ProgramCompilation(
+        compiler_output="\n\n".join(outputs),
+        executable=executable if successful_profile else None,
+        profile=successful_profile,
+        attempts=attempts,
+    )
+
+
+def _container_compiler_profiles(
+    language: str,
+    source_name: str,
+    executable_name: str,
+) -> list[tuple[str, list[str]]]:
+    if language == "rust":
+        return [
+            (
+                "rustc",
+                [
+                    "rustc",
+                    "-O",
+                    f"/work/{source_name}",
+                    "-o",
+                    f"/work/{executable_name}",
+                ],
+            )
+        ]
+
+    return [
+        (
+            compile_profile,
+            [
+                "gcc",
+                *flags,
+                "-O2",
+                "-pipe",
+                f"/work/{source_name}",
+                "-o",
+                f"/work/{executable_name}",
+                "-lm",
+            ],
+        )
+        for compile_profile, flags in C_COMPILER_PROFILES
+    ]
 
 
 def execution_command(

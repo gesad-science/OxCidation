@@ -1,3 +1,4 @@
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,10 +6,36 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from judge_execution import classify_oj_output, compile_c, run_oj_suite
-from judge_comparison import JudgeProfile, ProblemLimits, evaluate_program
+from judge_comparison import (
+    JudgeProfile,
+    ProblemLimits,
+    ProgramCompilation,
+    evaluate_program,
+)
 
 
 class JudgeOutputParsingTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("gcc"), "gcc is required for this integration test")
+    def test_real_c_compilation_uses_gnu89_fallback(self):
+        source = (
+            "inline int answer(void) { return 42; }\n"
+            "int (*answer_ptr)(void) = answer;\n"
+            "int main(void) { return answer_ptr() != 42; }\n"
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result, executable = compile_c(source, temp_dir)
+
+        self.assertEqual(result.compile_profile, "gnu89-compat")
+        self.assertEqual(
+            result.compile_attempts,
+            [
+                {"profile": "gnu11", "status": "failed"},
+                {"profile": "gnu89-compat", "status": "success"},
+            ],
+        )
+        self.assertTrue(executable.endswith("prog_c"))
+
     def test_c_compilation_falls_back_to_gnu89_compatibility(self):
         failed = SimpleNamespace(returncode=1, stdout="", stderr="gnu11 failed")
         succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -60,7 +87,12 @@ class JudgeOutputParsingTests(unittest.TestCase):
 
             with patch(
                 "judge_comparison.compile_program",
-                return_value=("compiler error", None),
+                return_value=ProgramCompilation(
+                    compiler_output="compiler error",
+                    executable=None,
+                    profile="",
+                    attempts=[{"profile": "rustc", "status": "failed"}],
+                ),
             ):
                 result = evaluate_program(
                     "rust",

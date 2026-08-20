@@ -1,4 +1,4 @@
-"""Reviewed and resumable preparation of generated visible-test suites."""
+"""Prepare reviewed, resumable visible-test batches from generated inputs."""
 
 import hashlib
 import json
@@ -10,14 +10,14 @@ from typing import Callable
 from judge_execution import compile_c
 from visible_testing import (
     OPERATIONAL_PREPARATION_STATUSES,
-    outputs_equal,
     prompt_sha256,
     run_program,
     source_sha256,
 )
 
 
-MAX_GENERATION_ATTEMPTS = 2
+MAX_GENERATION_ATTEMPTS = 3
+MAX_REVIEW_ATTEMPTS = 2
 
 
 @dataclass
@@ -29,20 +29,22 @@ class PreparationContext:
     model_provider: str
     model_id: str
     history: list[dict] = field(default_factory=list)
+    generation_attempt_count: int = 0
+    review_count: int = 0
     generation_prompt_tokens: int = 0
     generation_completion_tokens: int = 0
     review_prompt_tokens: int = 0
     review_completion_tokens: int = 0
     generated_candidate_count: int = 0
-    rejected_candidate_count: int = 0
-    invalid_case_count: int = 0
-    inconclusive_case_count: int = 0
+    deterministic_rejection_count: int = 0
+    validator_replacement_count: int = 0
 
-    def record(self, attempt_number: int, agent: str, action: str, data: dict) -> None:
+    def record(self, agent: str, action: str, data: dict) -> None:
         self.history.append(
             {
                 "sequence": len(self.history) + 1,
-                "attempt_number": attempt_number,
+                "generation_attempt": self.generation_attempt_count,
+                "review_attempt": self.review_count,
                 "agent": agent,
                 "action": action,
                 "data": data,
@@ -53,33 +55,29 @@ class PreparationContext:
         self.generation_prompt_tokens += usage.get("input_tokens", 0)
         self.generation_completion_tokens += usage.get("output_tokens", 0)
         self.generated_candidate_count += len(generation.get("cases", []))
-        self.rejected_candidate_count += len(attempt.get("rejected_cases", []))
+        self.deterministic_rejection_count += len(attempt["rejected_cases"])
 
     def add_review(self, review: dict, usage: dict) -> None:
         self.review_prompt_tokens += usage.get("input_tokens", 0)
         self.review_completion_tokens += usage.get("output_tokens", 0)
-        self.invalid_case_count += len(review["invalid_case_ids"])
-        self.inconclusive_case_count += len(review["inconclusive_case_ids"])
+        self.validator_replacement_count += len(review["replacements"])
 
     def finalize(
         self,
         status: str,
         review_status: str,
-        attempt_number: int,
         *,
-        attempt: dict | None = None,
+        batch: dict | None = None,
         review: dict | None = None,
+        unresolved_replacements: int = 0,
         details: str = "",
     ) -> dict:
         operational_failure = status in OPERATIONAL_PREPARATION_STATUSES
-        active_attempt = (
-            attempt["attempt_path"] if status == "ready" and attempt else ""
-        )
+        active_attempt = batch["attempt_path"] if status == "ready" and batch else ""
         active_dir = self.suite_root / active_attempt if active_attempt else None
         suite_hash = suite_sha256(active_dir) if active_dir else ""
         history_path = self.suite_root / "preparation_history.json"
         self.record(
-            attempt_number,
             "orchestrator",
             "preparation_failed" if operational_failure else "preparation_completed",
             {
@@ -87,10 +85,12 @@ class PreparationContext:
                 "review_status": review_status,
                 "active_attempt": active_attempt,
                 "suite_sha256": suite_hash,
+                "unresolved_replacements": unresolved_replacements,
                 "details": details,
             },
         )
         _write_json(history_path, self.history)
+
         manifest = {
             "status": status,
             "source": "generated",
@@ -100,19 +100,17 @@ class PreparationContext:
             "model_provider": self.model_provider,
             "model_id": self.model_id,
             "review_status": review_status,
-            "generation_attempt_count": attempt_number,
-            "candidate_count": attempt.get("candidate_count", 0) if attempt else 0,
+            "generation_attempt_count": self.generation_attempt_count,
+            "review_count": self.review_count,
+            "candidate_count": batch.get("candidate_count", 0) if batch else 0,
             "generated_candidate_count": self.generated_candidate_count,
-            "rejected_candidate_count": self.rejected_candidate_count,
-            "invalid_case_count": self.invalid_case_count,
-            "inconclusive_case_count": self.inconclusive_case_count,
-            "unresolved_replacement_count": (
-                attempt.get("unresolved_replacement_count", 0) if attempt else 0
-            ),
-            "case_count": attempt.get("case_count", 0) if active_attempt else 0,
-            "strategy": attempt.get("strategy", "") if attempt else "",
-            "cases": attempt.get("cases", []) if active_attempt else [],
-            "rejected_cases": attempt.get("rejected_cases", []) if attempt else [],
+            "deterministic_rejection_count": self.deterministic_rejection_count,
+            "validator_replacement_count": self.validator_replacement_count,
+            "unresolved_replacement_count": unresolved_replacements,
+            "case_count": batch.get("case_count", 0) if active_attempt else 0,
+            "strategy": batch.get("strategy", "") if batch else "",
+            "cases": batch.get("cases", []) if active_attempt else [],
+            "rejected_cases": batch.get("rejected_cases", []) if batch else [],
             "review": review or {},
             "prompt_tokens": self.generation_prompt_tokens,
             "completion_tokens": self.generation_completion_tokens,
@@ -123,12 +121,8 @@ class PreparationContext:
             "preparation_history_path": str(history_path),
             "frozen": not operational_failure,
             "details": details,
-            "c_compile_profile": (
-                attempt.get("c_compile_profile", "") if attempt else ""
-            ),
-            "c_compile_attempts": (
-                attempt.get("c_compile_attempts", []) if attempt else []
-            ),
+            "c_compile_profile": batch.get("c_compile_profile", "") if batch else "",
+            "c_compile_attempts": batch.get("c_compile_attempts", []) if batch else [],
         }
         return _write_suite_manifest(self.suite_root, manifest)
 
@@ -154,138 +148,241 @@ def prepare_generated_suite(
         model_provider,
         model_id,
     )
-    regeneration_feedback = ""
-    approved_cases: list[dict] = []
-    discarded_cases: list[dict] = []
-    saw_inconclusive = False
-    replacement_target = 0
 
-    for attempt_number in range(1, MAX_GENERATION_ATTEMPTS + 1):
-        try:
-            generation, generation_usage = generate_candidates(regeneration_feedback)
-        except Exception as error:
-            context.record(
-                attempt_number,
-                "tester",
-                "generation_failed",
-                {"details": str(error)},
-            )
-            return context.finalize(
-                "generation_failed",
-                "not_completed",
-                attempt_number,
-                details=f"Visible-test generation failed: {error}",
-            )
-
-        attempt = materialize_generation_attempt(
-            c_code,
-            generation,
-            suite_root,
-            attempt_number,
-            timeout_sec,
-            generation_prompt,
-            regeneration_feedback,
-            {case["input"] for case in approved_cases},
-            replacement_limit=(
-                json.loads(regeneration_feedback)["replacement_count"]
-                if regeneration_feedback
-                else None
-            ),
-        )
-        context.add_generation(generation, generation_usage, attempt)
-        _record_deterministic_results(context, attempt_number, attempt)
-
-        if attempt["status"] == "baseline_compile_failed":
+    with tempfile.TemporaryDirectory(prefix="oxcidation-visible-c-") as temp_dir:
+        compilation, c_binary = compile_c(c_code, temp_dir)
+        compile_metadata = _compile_metadata(compilation)
+        if compilation.returncode != 0:
+            failed_batch = _empty_batch(compile_metadata, compilation.stderr)
             return context.finalize(
                 "baseline_compile_failed",
                 "not_completed",
-                attempt_number,
-                attempt=attempt,
-                details=attempt["details"],
+                batch=failed_batch,
+                details=compilation.stderr,
             )
 
-        review_cases = attempt.get("review_cases", [])
         try:
-            review, review_usage = _review_attempt(
-                review_cases,
-                attempt,
-                review_candidates,
+            initial = _generate_attempt(
+                context,
+                generate_candidates,
+                c_binary,
+                timeout_sec,
+                compile_metadata,
+                feedback="",
             )
         except Exception as error:
-            details = f"Visible-test review failed: {error}"
-            context.record(
-                attempt_number,
-                "validator",
-                "review_failed",
-                {"details": details, "attempt_path": attempt["attempt_path"]},
+            return _generation_failure(context, error)
+
+        target_case_count = initial["candidate_count"]
+        strategy = initial["strategy"]
+        batch = _accepted_cases(initial)
+        discarded = _discarded_deterministic_cases(initial)
+        unresolved = set(_rejected_case_ids(initial))
+        rejected_inputs = _rejected_inputs(initial)
+
+        if unresolved and context.generation_attempt_count < MAX_GENERATION_ATTEMPTS:
+            try:
+                replacement = _generate_attempt(
+                    context,
+                    generate_candidates,
+                    c_binary,
+                    timeout_sec,
+                    compile_metadata,
+                    feedback=_replacement_request(
+                        sorted(unresolved),
+                        batch,
+                        rejected_inputs,
+                    ),
+                    slot_ids=sorted(unresolved),
+                    seen_inputs=_batch_inputs(batch) | rejected_inputs,
+                )
+            except Exception as error:
+                return _generation_failure(
+                    context,
+                    error,
+                    batch=_batch_result(
+                        batch,
+                        discarded,
+                        target_case_count,
+                        strategy,
+                        compile_metadata,
+                    ),
+                )
+            batch.update(_accepted_cases(replacement))
+            discarded.extend(_discarded_deterministic_cases(replacement))
+            unresolved = set(_rejected_case_ids(replacement))
+            rejected_inputs.update(_rejected_inputs(replacement))
+
+        if not batch:
+            unavailable = _batch_result(
+                batch,
+                discarded,
+                target_case_count,
+                strategy,
+                compile_metadata,
             )
+            return context.finalize(
+                "invalid_visible_tests",
+                "not_reviewed",
+                batch=unavailable,
+                unresolved_replacements=len(unresolved),
+                details="The C oracle rejected every generated input.",
+            )
+
+        review = _review_batch(context, batch, review_candidates)
+        if review.get("error"):
             return context.finalize(
                 "review_failed",
                 "not_completed",
-                attempt_number,
-                attempt=attempt,
-                details=details,
+                batch=_batch_result(
+                    batch,
+                    discarded,
+                    target_case_count,
+                    strategy,
+                    compile_metadata,
+                ),
+                details=review["error"],
             )
-        context.add_review(review, review_usage)
-        _record_review(context, attempt_number, attempt, review)
 
-        approved_in_attempt = _collect_approved_cases(attempt, review)
-        approved_cases.extend(approved_in_attempt)
-        rejected_for_replacement = _replacement_rejections(attempt, review)
-        discarded_cases.extend(_discarded_review_cases(attempt, review))
-        discarded_cases.extend(_discarded_deterministic_cases(attempt))
-        saw_inconclusive = saw_inconclusive or bool(review["inconclusive_case_ids"])
+        if review["assessment"] == "revise":
+            requested = {item["case_id"]: item for item in review["replacements"]}
+            rejected_inputs.update(
+                _discard_validator_replacements(batch, discarded, requested)
+            )
+            unresolved.update(requested)
+            if context.generation_attempt_count < MAX_GENERATION_ATTEMPTS:
+                try:
+                    replacement = _generate_attempt(
+                        context,
+                        generate_candidates,
+                        c_binary,
+                        timeout_sec,
+                        compile_metadata,
+                        feedback=_replacement_request(
+                            list(requested),
+                            batch,
+                            rejected_inputs,
+                            requested,
+                        ),
+                        slot_ids=list(requested),
+                        seen_inputs=_batch_inputs(batch) | rejected_inputs,
+                    )
+                except Exception as error:
+                    return _generation_failure(
+                        context,
+                        error,
+                        batch=_batch_result(
+                            batch,
+                            discarded,
+                            target_case_count,
+                            strategy,
+                            compile_metadata,
+                        ),
+                    )
+                batch.update(_accepted_cases(replacement))
+                discarded.extend(_discarded_deterministic_cases(replacement))
+                rejected_slots = set(_rejected_case_ids(replacement))
+                unresolved.difference_update(batch)
+                unresolved.update(rejected_slots)
+                rejected_inputs.update(_rejected_inputs(replacement))
 
-        if rejected_for_replacement and attempt_number < MAX_GENERATION_ATTEMPTS:
-            replacement_target = len(rejected_for_replacement)
-            regeneration_feedback = _replacement_feedback(rejected_for_replacement)
-            context.record(
-                attempt_number,
-                "validator",
-                "replacement_requested",
-                {
-                    "replacement_count": len(rejected_for_replacement),
-                    "rejected_cases": rejected_for_replacement,
-                    "guidance": regeneration_feedback,
-                },
-            )
-            continue
+            if unresolved and context.generation_attempt_count < MAX_GENERATION_ATTEMPTS:
+                try:
+                    recovery = _generate_attempt(
+                        context,
+                        generate_candidates,
+                        c_binary,
+                        timeout_sec,
+                        compile_metadata,
+                        feedback=_replacement_request(
+                            sorted(unresolved),
+                            batch,
+                            rejected_inputs,
+                        ),
+                        slot_ids=sorted(unresolved),
+                        seen_inputs=_batch_inputs(batch) | rejected_inputs,
+                    )
+                except Exception as error:
+                    return _generation_failure(
+                        context,
+                        error,
+                        batch=_batch_result(
+                            batch,
+                            discarded,
+                            target_case_count,
+                            strategy,
+                            compile_metadata,
+                        ),
+                    )
+                batch.update(_accepted_cases(recovery))
+                discarded.extend(_discarded_deterministic_cases(recovery))
+                unresolved = set(_rejected_case_ids(recovery))
 
-        if approved_cases:
-            unresolved_replacements = (
-                max(0, replacement_target - len(approved_in_attempt))
-                if attempt_number > 1
-                else 0
+            if batch and context.review_count < MAX_REVIEW_ATTEMPTS:
+                review = _review_batch(context, batch, review_candidates)
+                if review.get("error"):
+                    return context.finalize(
+                        "review_failed",
+                        "not_completed",
+                        batch=_batch_result(
+                            batch,
+                            discarded,
+                            target_case_count,
+                            strategy,
+                            compile_metadata,
+                        ),
+                        details=review["error"],
+                    )
+                if review["assessment"] == "revise":
+                    final_replacements = {
+                        item["case_id"]: item for item in review["replacements"]
+                    }
+                    rejected_inputs.update(
+                        _discard_validator_replacements(
+                            batch,
+                            discarded,
+                            final_replacements,
+                        )
+                    )
+                    unresolved.update(final_replacements)
+
+        if not batch:
+            unavailable = _batch_result(
+                batch,
+                discarded,
+                target_case_count,
+                strategy,
+                compile_metadata,
             )
-            frozen = _freeze_approved_cases(
-                context,
-                approved_cases,
-                discarded_cases,
-                attempt,
-                unresolved_replacements,
-            )
-            final_review = _approved_frozen_review(frozen, discarded_cases)
             return context.finalize(
-                "ready",
-                "approved",
-                attempt_number,
-                attempt=frozen,
-                review=final_review,
-                details=frozen["details"],
+                "invalid_visible_tests",
+                "revision_unresolved",
+                batch=unavailable,
+                review=review,
+                unresolved_replacements=len(unresolved),
+                details="No usable visible tests remained after batch review.",
             )
 
-        status = "review_inconclusive" if saw_inconclusive else "invalid_visible_tests"
-        review_status = "inconclusive" if saw_inconclusive else "invalid"
-        return context.finalize(
-            status,
-            review_status,
-            attempt_number,
-            attempt=attempt,
-            review=review,
-            details=review["diagnosis"],
+        frozen = _freeze_batch(
+            context,
+            batch,
+            discarded,
+            target_case_count,
+            strategy,
+            compile_metadata,
+            len(unresolved),
         )
-
-    raise AssertionError("Visible-test preparation exhausted without a terminal result.")
+        review_status = (
+            "approved" if review["assessment"] == "approved" else "revision_unresolved"
+        )
+        return context.finalize(
+            "ready",
+            review_status,
+            batch=frozen,
+            review=review,
+            unresolved_replacements=len(unresolved),
+            details=frozen["details"],
+        )
 
 
 def materialize_generation_attempt(
@@ -299,617 +396,651 @@ def materialize_generation_attempt(
     preserved_inputs: set[str] | None = None,
     replacement_limit: int | None = None,
 ) -> dict:
+    """Materialize one deterministic generation attempt without LLM review."""
     attempt_path = Path("attempts") / f"attempt-{attempt_number:02d}"
     attempt_dir = suite_root / attempt_path
     attempt_dir.mkdir(parents=True, exist_ok=True)
-    for path in attempt_dir.glob("case-*.*"):
-        path.unlink()
+    _clear_case_files(attempt_dir)
 
-    generated_candidates = generation.get("cases", [])
-    candidates = (
-        generated_candidates[:replacement_limit]
-        if replacement_limit is not None
-        else generated_candidates
-    )
+    candidates = generation.get("cases", [])
+    if replacement_limit is not None:
+        candidates = candidates[:replacement_limit]
+    slot_ids = _feedback_slot_ids(regeneration_feedback)
+    if not slot_ids:
+        slot_ids = [f"case-{index:03d}" for index in range(1, len(candidates) + 1)]
+    slot_ids = slot_ids[: len(candidates)]
+
+    with tempfile.TemporaryDirectory(prefix="oxcidation-visible-c-") as temp_dir:
+        compilation, c_binary = compile_c(c_code, temp_dir)
+        compile_metadata = _compile_metadata(compilation)
+        if compilation.returncode != 0:
+            result = _empty_attempt(
+                attempt_dir,
+                attempt_path,
+                generation.get("strategy", ""),
+                len(candidates),
+                compile_metadata,
+            )
+            result["prompt_sha256"] = prompt_sha256(generation_prompt)
+            result.update(status="baseline_compile_failed", details=compilation.stderr)
+            return result
+        result = _validate_candidates(
+            candidates,
+            slot_ids,
+            attempt_dir,
+            attempt_path,
+            c_binary,
+            timeout_sec,
+            generation.get("strategy", ""),
+            compile_metadata,
+            set(preserved_inputs or ()),
+        )
+        result["prompt_sha256"] = prompt_sha256(generation_prompt)
+
     _write_json(
         attempt_dir / "generation.json",
         {
             "strategy": generation.get("strategy", ""),
-            "cases": generated_candidates,
+            "cases": generation.get("cases", []),
             "selected_replacements": len(candidates),
             "requested_replacements": replacement_limit,
             "prompt_sha256": prompt_sha256(generation_prompt),
             "regeneration_feedback": regeneration_feedback,
         },
     )
-    result = _new_attempt_result(
-        attempt_dir,
-        attempt_path,
-        generation.get("strategy", ""),
-        len(candidates),
-        generation_prompt,
-    )
-
-    with tempfile.TemporaryDirectory(prefix="oxcidation-visible-c-") as temp_dir:
-        compilation, c_binary = compile_c(c_code, temp_dir)
-        result["c_compile_profile"] = getattr(
-            compilation,
-            "compile_profile",
-            "unknown",
-        )
-        result["c_compile_attempts"] = getattr(
-            compilation,
-            "compile_attempts",
-            [],
-        )
-        if compilation.returncode != 0:
-            result.update(status="baseline_compile_failed", details=compilation.stderr)
-            return result
-
-        seen_inputs = set(preserved_inputs or ())
-        for candidate_index, candidate in enumerate(candidates, start=1):
-            _materialize_candidate(
-                result,
-                attempt_dir,
-                c_binary,
-                candidate_index,
-                candidate,
-                timeout_sec,
-                seen_inputs,
-            )
-
-    result["case_count"] = len(result["cases"])
-    if result["case_count"]:
-        result.update(status="ready", details="")
     return result
 
 
-def _new_attempt_result(
+def _generate_attempt(
+    context: PreparationContext,
+    generate_candidates: Callable[[str], tuple[dict, dict]],
+    c_binary: str,
+    timeout_sec: float,
+    compile_metadata: dict,
+    *,
+    feedback: str,
+    slot_ids: list[str] | None = None,
+    seen_inputs: set[str] | None = None,
+) -> dict:
+    context.generation_attempt_count += 1
+    attempt_number = context.generation_attempt_count
+    request = _generation_request_summary(feedback)
+    context.record(
+        "orchestrator",
+        "test_generation_requested",
+        {
+            "kind": "replacement" if feedback else "initial",
+            **request,
+        },
+    )
+    generation, usage = generate_candidates(feedback)
+    attempt_path = Path("attempts") / f"attempt-{attempt_number:02d}"
+    attempt_dir = context.suite_root / attempt_path
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    _clear_case_files(attempt_dir)
+
+    generated = generation.get("cases", [])
+    selected = generated[: len(slot_ids)] if slot_ids is not None else generated
+    assigned_slots = slot_ids or [
+        f"case-{index:03d}" for index in range(1, len(selected) + 1)
+    ]
+    result = _validate_candidates(
+        selected,
+        assigned_slots,
+        attempt_dir,
+        attempt_path,
+        c_binary,
+        timeout_sec,
+        generation.get("strategy", ""),
+        compile_metadata,
+        set(seen_inputs or ()),
+    )
+    _write_json(
+        attempt_dir / "generation.json",
+        {
+            "strategy": generation.get("strategy", ""),
+            "cases": generated,
+            "assigned_slots": assigned_slots,
+            "selected_count": len(selected),
+            "feedback": feedback,
+            "prompt_sha256": prompt_sha256(context.generation_prompt),
+        },
+    )
+    _write_json(attempt_dir / "deterministic_validation.json", result)
+    context.add_generation(generation, usage, result)
+    context.record(
+        "tester",
+        "deterministic_validation",
+        {
+            "attempt_path": str(attempt_path),
+            "strategy": result["strategy"],
+            "candidate_count": result["candidate_count"],
+            "accepted_count": result["case_count"],
+            "rejected_count": len(result["rejected_cases"]),
+            "evaluations": result["deterministic_evaluations"],
+        },
+    )
+    return result
+
+
+def _validate_candidates(
+    candidates: list[dict],
+    slot_ids: list[str],
     attempt_dir: Path,
     attempt_path: Path,
+    c_binary: str,
+    timeout_sec: float,
     strategy: str,
-    candidate_count: int,
-    generation_prompt: str,
+    compile_metadata: dict,
+    seen_inputs: set[str],
 ) -> dict:
-    return {
-        "status": "no_valid_cases",
-        "suite_dir": str(attempt_dir),
-        "attempt_path": str(attempt_path),
-        "prompt_sha256": prompt_sha256(generation_prompt),
-        "strategy": strategy,
-        "candidate_count": candidate_count,
-        "case_count": 0,
-        "cases": [],
-        "rejected_cases": [],
-        "deterministic_evaluations": [],
-        "review_cases": [],
-        "details": "The C oracle rejected every generated input.",
-    }
+    result = _empty_attempt(
+        attempt_dir,
+        attempt_path,
+        strategy,
+        len(slot_ids),
+        compile_metadata,
+    )
+    for slot_id, candidate in zip(slot_ids, candidates):
+        _validate_candidate(
+            result,
+            attempt_dir,
+            c_binary,
+            slot_id,
+            candidate,
+            timeout_sec,
+            seen_inputs,
+        )
+    for slot_id in slot_ids[len(candidates) :]:
+        candidate_id = f"candidate-{len(result['deterministic_evaluations']) + 1:03d}"
+        rejection = _rejected_case(
+            slot_id,
+            candidate_id,
+            "",
+            "",
+            "MISSING_REPLACEMENT",
+            "The generator did not return a candidate for this requested slot.",
+        )
+        result["rejected_cases"].append(rejection)
+        result["deterministic_evaluations"].append(
+            _deterministic_evaluation(slot_id, candidate_id, rejection["verdict"])
+        )
+    result["case_count"] = len(result["cases"])
+    result["status"] = "ready" if result["cases"] else "no_valid_cases"
+    result["details"] = (
+        "" if result["cases"] else "The C oracle rejected every generated input."
+    )
+    return result
 
 
-def _materialize_candidate(
+def _validate_candidate(
     result: dict,
     attempt_dir: Path,
     c_binary: str,
-    candidate_index: int,
+    case_id: str,
     candidate: dict,
     timeout_sec: float,
     seen_inputs: set[str],
 ) -> None:
     input_data = candidate.get("input", "")
     purpose = candidate.get("purpose", "").strip()
+    candidate_id = f"candidate-{len(result['deterministic_evaluations']) + 1:03d}"
     if input_data in seen_inputs:
         rejection = _rejected_case(
-            candidate_index,
+            case_id,
+            candidate_id,
             purpose,
+            input_data,
             "DUPLICATE_INPUT",
-            "Duplicate input.",
+            "Duplicate or previously rejected input.",
         )
-        rejection["input"] = input_data
         result["rejected_cases"].append(rejection)
-        result["review_cases"].append(
-            {
-                "id": f"candidate-{candidate_index:03d}",
-                "purpose": purpose,
-                "input": input_data,
-            }
-        )
         result["deterministic_evaluations"].append(
-            _deterministic_evaluation(candidate_index, rejection["verdict"])
+            _deterministic_evaluation(case_id, candidate_id, rejection["verdict"])
         )
         return
     seen_inputs.add(input_data)
 
-    first_run = run_program(c_binary, input_data, timeout_sec)
-    second_run = run_program(c_binary, input_data, timeout_sec)
-    rejection = _stability_rejection(
-        candidate_index,
+    execution = run_program(c_binary, input_data, timeout_sec)
+    rejection = _execution_rejection(
+        case_id,
+        candidate_id,
         purpose,
-        first_run,
-        second_run,
+        input_data,
+        execution,
     )
     if rejection:
-        rejection["input"] = input_data
         result["rejected_cases"].append(rejection)
-        result["review_cases"].append(
-            {
-                "id": f"candidate-{candidate_index:03d}",
-                "purpose": purpose,
-                "input": input_data,
-            }
-        )
         result["deterministic_evaluations"].append(
             _deterministic_evaluation(
-                candidate_index,
+                case_id,
+                candidate_id,
                 rejection["verdict"],
-                first_run,
-                second_run,
+                execution,
             )
         )
         return
 
-    case_id = f"case-{len(result['cases']) + 1:03d}"
     input_file = f"{case_id}.in"
     output_file = f"{case_id}.out"
     (attempt_dir / input_file).write_text(input_data, encoding="utf-8")
-    (attempt_dir / output_file).write_text(first_run["stdout"], encoding="utf-8")
+    (attempt_dir / output_file).write_text(execution["stdout"], encoding="utf-8")
     result["cases"].append(
         {
             "id": case_id,
-            "candidate_id": f"candidate-{candidate_index:03d}",
+            "candidate_id": candidate_id,
             "purpose": purpose,
+            "input": input_data,
+            "output": execution["stdout"],
             "input_file": input_file,
             "output_file": output_file,
+            "origin_attempt": str(result["attempt_path"]),
         }
-    )
-    result["review_cases"].append(
-        {"id": case_id, "purpose": purpose, "input": input_data}
     )
     result["deterministic_evaluations"].append(
         _deterministic_evaluation(
-            candidate_index,
-            "ACCEPTED_STABLE",
-            first_run,
-            second_run,
             case_id,
+            candidate_id,
+            "ACCEPTED",
+            execution,
         )
     )
 
 
-def _review_attempt(
-    review_cases: list[dict],
-    attempt: dict,
+def _review_batch(
+    context: PreparationContext,
+    batch: dict[str, dict],
     review_candidates: Callable[[list[dict], dict], tuple[dict, dict]],
-) -> tuple[dict, dict]:
-    if not review_cases:
-        return {
-            "assessment": "invalid",
-            "diagnosis": "The deterministic C oracle rejected every generated input.",
-            "verified_case_ids": [],
-            "invalid_case_ids": [],
-            "inconclusive_case_ids": [],
-            "case_reviews": [],
-            "regeneration_guidance": (
-                "Generate complete inputs that terminate normally and produce stable output "
-                "when executed by the C program."
-            ),
-        }, {}
+) -> dict:
+    context.review_count += 1
+    cases = [
+        {"id": case_id, "purpose": case["purpose"], "input": case["input"]}
+        for case_id, case in sorted(batch.items())
+    ]
     deterministic_report = {
-        "candidate_count": attempt["candidate_count"],
-        "accepted_count": attempt["case_count"],
-        "rejected_cases": attempt["rejected_cases"],
-        "evaluations": attempt["deterministic_evaluations"],
+        "case_count": len(cases),
+        "executions_per_case": 1,
+        "status": "all_cases_accepted",
     }
-    review, usage = review_candidates(review_cases, deterministic_report)
-    return _normalize_review(review, {case["id"] for case in review_cases}), usage
+    try:
+        raw_review, usage = review_candidates(cases, deterministic_report)
+        review = _normalize_batch_review(raw_review, set(batch))
+    except Exception as error:
+        details = f"Visible-test batch review failed: {error}"
+        context.record("validator", "review_failed", {"details": details})
+        return {"error": details}
 
-
-def _record_deterministic_results(
-    context: PreparationContext,
-    attempt_number: int,
-    attempt: dict,
-) -> None:
+    context.add_review(review, usage)
+    review_path = Path("reviews") / f"review-{context.review_count:02d}.json"
+    _write_json(context.suite_root / review_path, {"cases": cases, "review": review})
     context.record(
-        attempt_number,
-        "tester",
-        "generated_candidates",
-        {
-            "candidate_count": attempt["candidate_count"],
-            "strategy": attempt["strategy"],
-            "attempt_path": attempt["attempt_path"],
-        },
-    )
-    context.record(
-        attempt_number,
-        "tester",
-        "deterministic_validation",
-        {
-            "status": attempt["status"],
-            "c_compile_profile": attempt.get("c_compile_profile", ""),
-            "c_compile_attempts": attempt.get("c_compile_attempts", []),
-            "accepted_count": attempt["case_count"],
-            "rejected_count": len(attempt["rejected_cases"]),
-            "evaluations": attempt["deterministic_evaluations"],
-            "attempt_path": attempt["attempt_path"],
-        },
-    )
-
-
-def _record_review(
-    context: PreparationContext,
-    attempt_number: int,
-    attempt: dict,
-    review: dict,
-) -> None:
-    attempt_dir = Path(attempt["suite_dir"])
-    _write_json(attempt_dir / "review.json", review)
-    attempt_manifest = {
-        key: value
-        for key, value in attempt.items()
-        if key not in {"suite_dir", "review_cases"}
-    }
-    attempt_manifest["review"] = review
-    _write_json(attempt_dir / "attempt.json", attempt_manifest)
-    context.record(
-        attempt_number,
         "validator",
-        "case_review",
+        "batch_review",
         {
             "assessment": review["assessment"],
-            "diagnosis": review["diagnosis"],
-            "approved_case_count": len(review["verified_case_ids"]),
-            "invalid_case_count": len(review["invalid_case_ids"]),
-            "inconclusive_case_count": len(review["inconclusive_case_ids"]),
-            "case_reviews": review["case_reviews"],
-            "attempt_path": attempt["attempt_path"],
+            "replacement_count": len(review["replacements"]),
+            "replacements": review["replacements"],
+            "review_path": str(review_path),
         },
     )
+    return review
 
 
-def _normalize_review(review: dict, known_case_ids: set[str]) -> dict:
-    case_reviews = review.get("case_reviews")
-    if not isinstance(case_reviews, list):
-        case_reviews = _legacy_case_reviews(review, known_case_ids)
-
-    reviewed_ids = [item.get("case_id") for item in case_reviews]
-    duplicate_ids = {case_id for case_id in reviewed_ids if reviewed_ids.count(case_id) > 1}
-    if duplicate_ids:
-        raise ValueError(
-            "Visible-test review repeated cases: " + ", ".join(sorted(duplicate_ids))
-        )
-    reviewed_set = set(reviewed_ids)
-    if reviewed_set != known_case_ids:
-        missing = known_case_ids - reviewed_set
-        unknown = reviewed_set - known_case_ids
-        details = []
-        if missing:
-            details.append("missing " + ", ".join(sorted(missing)))
-        if unknown:
-            details.append("unknown " + ", ".join(sorted(unknown)))
-        raise ValueError(
-            "Visible-test review must assess every supplied case: " + "; ".join(details)
-        )
-
-    normalized_cases = []
-    for item in case_reviews:
-        assessment = item.get("assessment")
-        if assessment not in {"approved", "invalid", "inconclusive"}:
-            raise ValueError(
-                f"Unsupported visible-test case assessment: {assessment}"
-            )
-        normalized_cases.append(
-            {
-                "case_id": item["case_id"],
-                "assessment": assessment,
-                "diagnosis": str(item.get("diagnosis", "")).strip(),
-                "regeneration_guidance": str(
-                    item.get("regeneration_guidance", "")
-                ).strip(),
-            }
-        )
-
-    verified_case_ids = [
-        item["case_id"] for item in normalized_cases if item["assessment"] == "approved"
-    ]
-    invalid_case_ids = [
-        item["case_id"] for item in normalized_cases if item["assessment"] == "invalid"
-    ]
-    inconclusive_case_ids = [
-        item["case_id"]
-        for item in normalized_cases
-        if item["assessment"] == "inconclusive"
-    ]
-    assessment = (
-        "invalid"
-        if invalid_case_ids
-        else "inconclusive"
-        if inconclusive_case_ids
-        else "approved"
-    )
-    diagnosis = " ".join(
-        f"{item['case_id']}: {item['diagnosis']}"
-        for item in normalized_cases
-        if item["diagnosis"]
-    )
-    regeneration_guidance = " ".join(
-        f"{item['case_id']}: {item['regeneration_guidance']}"
-        for item in normalized_cases
-        if item["assessment"] == "invalid" and item["regeneration_guidance"]
-    )
-
-    return {
-        "assessment": assessment,
-        "diagnosis": diagnosis,
-        "verified_case_ids": verified_case_ids,
-        "invalid_case_ids": invalid_case_ids,
-        "inconclusive_case_ids": inconclusive_case_ids,
-        "case_reviews": normalized_cases,
-        "regeneration_guidance": regeneration_guidance,
-    }
-
-
-def _legacy_case_reviews(review: dict, known_case_ids: set[str]) -> list[dict]:
+def _normalize_batch_review(review: dict, known_case_ids: set[str]) -> dict:
     assessment = review.get("assessment")
-    if assessment not in {"approved", "invalid", "inconclusive"}:
-        raise ValueError("Visible-test review must contain case_reviews.")
-    verified = set(review.get("verified_case_ids", []))
-    invalid = set(review.get("invalid_case_ids", []))
-    if verified & invalid:
-        raise ValueError("A visible-test case cannot be both verified and invalid.")
-    if assessment == "approved" and verified != known_case_ids:
-        raise ValueError(
-            "An approved visible-test review must explicitly verify every case."
-        )
-    if assessment == "invalid" and not invalid:
-        raise ValueError("An invalid visible-test review must identify at least one case.")
-    case_reviews = []
-    for case_id in sorted(known_case_ids):
-        case_assessment = (
-            "approved"
-            if case_id in verified
-            else "invalid"
-            if case_id in invalid
-            else "inconclusive"
-        )
-        case_reviews.append(
+    replacements = review.get("replacements")
+    if assessment not in {"approved", "revise"}:
+        raise ValueError(f"Unsupported batch assessment: {assessment}")
+    if not isinstance(replacements, list):
+        raise ValueError("Visible-test batch review must contain replacements.")
+    if assessment == "approved" and replacements:
+        raise ValueError("An approved batch cannot request replacements.")
+    if assessment == "revise" and not replacements:
+        raise ValueError("A batch revision must request at least one replacement.")
+
+    normalized = []
+    seen = set()
+    for item in replacements:
+        case_id = item.get("case_id")
+        if case_id not in known_case_ids:
+            raise ValueError(f"Batch review referenced unknown case: {case_id}")
+        if case_id in seen:
+            raise ValueError(f"Batch review repeated case: {case_id}")
+        reason = str(item.get("reason", "")).strip()
+        requirements = str(item.get("requirements", "")).strip()
+        if not reason or not requirements:
+            raise ValueError("Every replacement needs a reason and requirements.")
+        seen.add(case_id)
+        normalized.append(
             {
                 "case_id": case_id,
-                "assessment": case_assessment,
-                "diagnosis": review.get("diagnosis", ""),
-                "regeneration_guidance": (
-                    review.get("regeneration_guidance", "")
-                    if case_assessment == "invalid"
-                    else ""
+                "reason": reason,
+                "requirements": requirements,
+            }
+        )
+    return {"assessment": assessment, "replacements": normalized}
+
+
+def _replacement_request(
+    slot_ids: list[str],
+    batch: dict[str, dict],
+    rejected_inputs: set[str],
+    validator_requests: dict[str, dict] | None = None,
+) -> str:
+    validator_requests = validator_requests or {}
+    slots = []
+    for case_id in slot_ids:
+        request = validator_requests.get(case_id, {})
+        slots.append(
+            {
+                "case_id": case_id,
+                "requirements": request.get(
+                    "requirements",
+                    "Generate a valid input distinct from all retained and rejected inputs.",
                 ),
             }
         )
-    return case_reviews
-
-
-def _collect_approved_cases(attempt: dict, review: dict) -> list[dict]:
-    approved_ids = set(review["verified_case_ids"])
-    attempt_dir = Path(attempt["suite_dir"])
-    approved = []
-    for case in attempt["cases"]:
-        if case["id"] not in approved_ids:
-            continue
-        approved.append(
-            {
-                "purpose": case["purpose"],
-                "input": (attempt_dir / case["input_file"]).read_text(encoding="utf-8"),
-                "output": (attempt_dir / case["output_file"]).read_text(encoding="utf-8"),
-                "origin_attempt": attempt["attempt_path"],
-                "origin_case_id": case["id"],
-                "origin_candidate_id": case["candidate_id"],
-            }
-        )
-    return approved
-
-
-def _replacement_rejections(attempt: dict, review: dict) -> list[dict]:
-    cases_by_id = {case["id"]: case for case in attempt["review_cases"]}
-    reviews_by_id = {item["case_id"]: item for item in review["case_reviews"]}
-    deterministic_by_id = {
-        f"candidate-{item['candidate']:03d}": item
-        for item in attempt["rejected_cases"]
-    }
-    rejected = []
-    for case_id, item in deterministic_by_id.items():
-        case_review = reviews_by_id[case_id]
-        rejected.append(
-            {
-                "origin": "deterministic_validation",
-                "case_id": case_id,
-                "purpose": item["purpose"],
-                "input": item.get("input", ""),
-                "verdict": item["verdict"],
-                "guidance": (
-                    case_review["regeneration_guidance"]
-                    or case_review["diagnosis"]
-                    or item.get("details", "")
-                ),
-            }
-        )
-    for case_id in review["invalid_case_ids"]:
-        if case_id in deterministic_by_id:
-            continue
-        case_review = reviews_by_id[case_id]
-        rejected.append(
-            {
-                "origin": "validator",
-                "case_id": case_id,
-                "purpose": cases_by_id[case_id]["purpose"],
-                "input": cases_by_id[case_id]["input"],
-                "verdict": "INVALID",
-                "guidance": (
-                    case_review["regeneration_guidance"]
-                    or case_review["diagnosis"]
-                ),
-            }
-        )
-    return rejected
-
-
-def _discarded_review_cases(attempt: dict, review: dict) -> list[dict]:
-    cases_by_id = {case["id"]: case for case in attempt["review_cases"]}
-    deterministic_ids = {
-        f"candidate-{item['candidate']:03d}" for item in attempt["rejected_cases"]
-    }
-    return [
-        {
-            "origin_attempt": attempt["attempt_path"],
-            "case_id": item["case_id"],
-            "purpose": cases_by_id[item["case_id"]]["purpose"],
-            "input": cases_by_id[item["case_id"]]["input"],
-            "assessment": item["assessment"],
-            "diagnosis": item["diagnosis"],
-        }
-        for item in review["case_reviews"]
-        if item["assessment"] != "approved" and item["case_id"] not in deterministic_ids
-    ]
-
-
-def _discarded_deterministic_cases(attempt: dict) -> list[dict]:
-    return [
-        {
-            "origin_attempt": attempt["attempt_path"],
-            "candidate_id": f"candidate-{item['candidate']:03d}",
-            "purpose": item["purpose"],
-            "input": item.get("input", ""),
-            "assessment": "deterministic_rejection",
-            "diagnosis": item["verdict"],
-        }
-        for item in attempt["rejected_cases"]
-    ]
-
-
-def _replacement_feedback(rejected_cases: list[dict]) -> str:
     return json.dumps(
         {
-            "replacement_count": len(rejected_cases),
-            "rejected_cases": rejected_cases,
+            "replacement_slots": slots,
+            "retained_cases": [
+                {
+                    "case_id": case_id,
+                    "purpose": case["purpose"],
+                    "input": case["input"],
+                }
+                for case_id, case in sorted(batch.items())
+            ],
+            "forbidden_inputs": sorted(rejected_inputs),
         },
         ensure_ascii=False,
     )
 
 
-def _freeze_approved_cases(
+def _discard_validator_replacements(
+    batch: dict[str, dict],
+    discarded: list[dict],
+    requested: dict[str, dict],
+) -> set[str]:
+    rejected_inputs = set()
+    for case_id, feedback in requested.items():
+        case = batch.pop(case_id)
+        rejected_inputs.add(case["input"])
+        discarded.append(
+            {
+                "origin": "validator",
+                "case_id": case_id,
+                "purpose": case["purpose"],
+                "input": case["input"],
+                "reason": feedback["reason"],
+                "requirements": feedback["requirements"],
+            }
+        )
+    return rejected_inputs
+
+
+def _freeze_batch(
     context: PreparationContext,
-    approved_cases: list[dict],
-    discarded_cases: list[dict],
-    latest_attempt: dict,
-    unresolved_replacement_count: int,
+    batch: dict[str, dict],
+    discarded: list[dict],
+    target_case_count: int,
+    strategy: str,
+    compile_metadata: dict,
+    unresolved_replacements: int,
 ) -> dict:
     frozen_path = Path("frozen")
     frozen_dir = context.suite_root / frozen_path
     frozen_dir.mkdir(parents=True, exist_ok=True)
-    for path in frozen_dir.glob("case-*.*"):
-        path.unlink()
+    _clear_case_files(frozen_dir)
 
     cases = []
-    for index, approved in enumerate(approved_cases, start=1):
-        case_id = f"case-{index:03d}"
+    for case_id, case in sorted(batch.items()):
         input_file = f"{case_id}.in"
         output_file = f"{case_id}.out"
-        (frozen_dir / input_file).write_text(approved["input"], encoding="utf-8")
-        (frozen_dir / output_file).write_text(approved["output"], encoding="utf-8")
+        (frozen_dir / input_file).write_text(case["input"], encoding="utf-8")
+        (frozen_dir / output_file).write_text(case["output"], encoding="utf-8")
         cases.append(
             {
                 "id": case_id,
-                "purpose": approved["purpose"],
+                "purpose": case["purpose"],
                 "input_file": input_file,
                 "output_file": output_file,
-                "origin_attempt": approved["origin_attempt"],
-                "origin_case_id": approved["origin_case_id"],
-                "origin_candidate_id": approved["origin_candidate_id"],
+                "origin_attempt": case["origin_attempt"],
+                "origin_candidate_id": case["candidate_id"],
             }
         )
 
     details = ""
-    if unresolved_replacement_count:
+    if unresolved_replacements:
         details = (
-            f"Frozen {len(cases)} approved cases; "
-            f"{unresolved_replacement_count} requested replacements remained unavailable."
+            f"Frozen {len(cases)} usable cases; {unresolved_replacements} requested "
+            "replacements remained unresolved."
         )
-    frozen = {
+    result = {
         "status": "ready",
         "suite_dir": str(frozen_dir),
         "attempt_path": str(frozen_path),
-        "strategy": "Approved cases preserved across generation attempts.",
-        "candidate_count": len(cases),
+        "strategy": strategy,
+        "candidate_count": target_case_count,
         "case_count": len(cases),
         "cases": cases,
-        "rejected_cases": discarded_cases,
-        "deterministic_evaluations": [],
-        "review_cases": [],
+        "rejected_cases": discarded,
         "details": details,
-        "unresolved_replacement_count": unresolved_replacement_count,
-        "c_compile_profile": latest_attempt.get("c_compile_profile", ""),
-        "c_compile_attempts": latest_attempt.get("c_compile_attempts", []),
+        **compile_metadata,
     }
     _write_json(
         frozen_dir / "suite_composition.json",
         {
+            "target_case_count": target_case_count,
             "cases": cases,
-            "discarded_cases": discarded_cases,
-            "unresolved_replacement_count": unresolved_replacement_count,
+            "discarded_cases": discarded,
+            "unresolved_replacement_count": unresolved_replacements,
         },
     )
-    return frozen
+    return result
 
 
-def _approved_frozen_review(frozen: dict, discarded_cases: list[dict]) -> dict:
+def _batch_result(
+    batch: dict[str, dict],
+    discarded: list[dict],
+    target_case_count: int,
+    strategy: str,
+    compile_metadata: dict,
+) -> dict:
     return {
-        "assessment": "approved",
-        "diagnosis": "Every case in the frozen suite was individually approved.",
-        "verified_case_ids": [case["id"] for case in frozen["cases"]],
-        "invalid_case_ids": [],
-        "inconclusive_case_ids": [],
-        "case_reviews": [
-            {
-                "case_id": case["id"],
-                "assessment": "approved",
-                "diagnosis": (
-                    f"Preserved from {case['origin_attempt']}:{case['origin_case_id']}."
-                ),
-                "regeneration_guidance": "",
-            }
-            for case in frozen["cases"]
-        ],
-        "regeneration_guidance": "",
-        "discarded_cases": discarded_cases,
+        "status": "ready" if batch else "no_valid_cases",
+        "attempt_path": "",
+        "candidate_count": target_case_count,
+        "case_count": len(batch),
+        "strategy": strategy,
+        "cases": list(batch.values()),
+        "rejected_cases": discarded,
+        "details": "",
+        **compile_metadata,
     }
 
 
-def _stability_rejection(
-    candidate_index: int,
+def _empty_batch(compile_metadata: dict, details: str) -> dict:
+    return {
+        "status": "baseline_compile_failed",
+        "attempt_path": "",
+        "candidate_count": 0,
+        "case_count": 0,
+        "strategy": "",
+        "cases": [],
+        "rejected_cases": [],
+        "details": details,
+        **compile_metadata,
+    }
+
+
+def _empty_attempt(
+    attempt_dir: Path,
+    attempt_path: Path,
+    strategy: str,
+    candidate_count: int,
+    compile_metadata: dict,
+) -> dict:
+    return {
+        "status": "no_valid_cases",
+        "suite_dir": str(attempt_dir),
+        "attempt_path": str(attempt_path),
+        "strategy": strategy,
+        "candidate_count": candidate_count,
+        "case_count": 0,
+        "cases": [],
+        "rejected_cases": [],
+        "deterministic_evaluations": [],
+        "details": "The C oracle rejected every generated input.",
+        **compile_metadata,
+    }
+
+
+def _generation_failure(
+    context: PreparationContext,
+    error: Exception,
+    *,
+    batch: dict | None = None,
+) -> dict:
+    details = f"Visible-test generation failed: {error}"
+    context.record("tester", "generation_failed", {"details": details})
+    return context.finalize(
+        "generation_failed",
+        "not_completed",
+        batch=batch,
+        details=details,
+    )
+
+
+def _compile_metadata(compilation) -> dict:
+    return {
+        "c_compile_profile": getattr(compilation, "compile_profile", "unknown"),
+        "c_compile_attempts": getattr(compilation, "compile_attempts", []),
+    }
+
+
+def _accepted_cases(attempt: dict) -> dict[str, dict]:
+    return {case["id"]: case for case in attempt["cases"]}
+
+
+def _batch_inputs(batch: dict[str, dict]) -> set[str]:
+    return {case["input"] for case in batch.values()}
+
+
+def _rejected_case_ids(attempt: dict) -> list[str]:
+    return [case["case_id"] for case in attempt["rejected_cases"]]
+
+
+def _rejected_inputs(attempt: dict) -> set[str]:
+    return {case["input"] for case in attempt["rejected_cases"]}
+
+
+def _discarded_deterministic_cases(attempt: dict) -> list[dict]:
+    return [
+        {
+            "origin": "deterministic_validation",
+            "case_id": case["case_id"],
+            "purpose": case["purpose"],
+            "input": case["input"],
+            "verdict": case["verdict"],
+        }
+        for case in attempt["rejected_cases"]
+    ]
+
+
+def _feedback_slot_ids(feedback: str) -> list[str]:
+    if not feedback:
+        return []
+    try:
+        payload = json.loads(feedback)
+    except json.JSONDecodeError:
+        return []
+    return [item["case_id"] for item in payload.get("replacement_slots", [])]
+
+
+def _generation_request_summary(feedback: str) -> dict:
+    if not feedback:
+        return {
+            "requested_case_ids": [],
+            "retained_case_ids": [],
+            "forbidden_input_count": 0,
+        }
+    try:
+        payload = json.loads(feedback)
+    except json.JSONDecodeError:
+        return {
+            "requested_case_ids": [],
+            "retained_case_ids": [],
+            "forbidden_input_count": 0,
+        }
+    return {
+        "requested_case_ids": [
+            item["case_id"] for item in payload.get("replacement_slots", [])
+        ],
+        "retained_case_ids": [
+            item["case_id"] for item in payload.get("retained_cases", [])
+        ],
+        "forbidden_input_count": len(payload.get("forbidden_inputs", [])),
+    }
+
+
+def _clear_case_files(directory: Path) -> None:
+    for path in directory.glob("case-*.*"):
+        path.unlink()
+
+
+def _execution_rejection(
+    case_id: str,
+    candidate_id: str,
     purpose: str,
-    first_run: dict,
-    second_run: dict,
+    input_data: str,
+    execution: dict,
 ) -> dict | None:
-    if first_run["status"] != "ACCEPTED":
+    if execution["status"] != "ACCEPTED":
         return _rejected_case(
-            candidate_index,
+            case_id,
+            candidate_id,
             purpose,
-            first_run["status"],
-            first_run.get("stderr", ""),
-        )
-    if second_run["status"] != "ACCEPTED":
-        return _rejected_case(
-            candidate_index,
-            purpose,
-            "UNSTABLE_EXECUTION",
-            f"Second C execution returned {second_run['status']}. "
-            f"{second_run.get('stderr', '')}",
-        )
-    if not outputs_equal(first_run["stdout"], second_run["stdout"]):
-        return _rejected_case(
-            candidate_index,
-            purpose,
-            "NONDETERMINISTIC_OUTPUT",
-            "Repeated C executions produced different normalized outputs.",
+            input_data,
+            execution["status"],
+            execution.get("stderr", ""),
         )
     return None
+
+
+def _rejected_case(
+    case_id: str,
+    candidate_id: str,
+    purpose: str,
+    input_data: str,
+    verdict: str,
+    details: str,
+) -> dict:
+    return {
+        "case_id": case_id,
+        "candidate_id": candidate_id,
+        "purpose": purpose,
+        "input": input_data,
+        "verdict": verdict,
+        "details": details[:1000],
+    }
+
+
+def _deterministic_evaluation(
+    case_id: str,
+    candidate_id: str,
+    verdict: str,
+    execution: dict | None = None,
+) -> dict:
+    execution = execution or {}
+    stdout = execution.get("stdout", "")
+    return {
+        "case_id": case_id,
+        "candidate_id": candidate_id,
+        "verdict": verdict,
+        "run_status": execution.get("status", "not_run"),
+        "output_bytes": len(stdout.encode("utf-8")),
+    }
 
 
 def suite_sha256(suite_dir: Path) -> str:
@@ -920,42 +1051,6 @@ def suite_sha256(suite_dir: Path) -> str:
     return digest.hexdigest()
 
 
-def _deterministic_evaluation(
-    candidate_index: int,
-    verdict: str,
-    first_run: dict | None = None,
-    second_run: dict | None = None,
-    case_id: str = "",
-) -> dict:
-    first_run = first_run or {}
-    second_run = second_run or {}
-    first_stdout = first_run.get("stdout", "")
-    second_stdout = second_run.get("stdout", "")
-    return {
-        "candidate_id": f"candidate-{candidate_index:03d}",
-        "case_id": case_id,
-        "verdict": verdict,
-        "first_run_status": first_run.get("status", "not_run"),
-        "second_run_status": second_run.get("status", "not_run"),
-        "first_output_bytes": len(first_stdout.encode("utf-8")),
-        "second_output_bytes": len(second_stdout.encode("utf-8")),
-        "stable_output_empty": (
-            bool(first_run)
-            and bool(second_run)
-            and not first_stdout
-            and not second_stdout
-        ),
-        "normalized_outputs_match": (
-            bool(first_run)
-            and bool(second_run)
-            and outputs_equal(
-                first_stdout,
-                second_stdout,
-            )
-        ),
-    }
-
-
 def _write_suite_manifest(suite_root: Path, manifest: dict) -> dict:
     _write_json(suite_root / "suite.json", manifest)
     active_attempt = manifest.get("active_attempt", "")
@@ -964,13 +1059,5 @@ def _write_suite_manifest(suite_root: Path, manifest: dict) -> dict:
 
 
 def _write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _rejected_case(index: int, purpose: str, verdict: str, details: str) -> dict:
-    return {
-        "candidate": index,
-        "purpose": purpose,
-        "verdict": verdict,
-        "details": details[:1000],
-    }

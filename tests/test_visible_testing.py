@@ -20,25 +20,24 @@ class VisibleTestGenerationTests(unittest.TestCase):
         prompt = load_generation_prompt()
 
         self.assertIn("{c_code}", prompt)
-        self.assertIn("Choose how many cases are necessary", prompt)
-        self.assertIn("Do not reduce the number of cases", prompt)
+        self.assertIn("Choose the number of cases needed", prompt)
+        self.assertIn("observable behavior", prompt)
+        self.assertIn("make each input complete", prompt)
         self.assertNotIn("Prefer a compact suite", prompt)
-        self.assertIn("Do not use or assume a problem statement", prompt)
-        self.assertIn("input-dependent loops", prompt)
-        self.assertIn("conversion counts", prompt)
-        self.assertIn("main processing logic", prompt)
+        self.assertIn("Do not assume a problem statement", prompt)
+        self.assertNotIn("input-dependent loops", prompt)
+        self.assertNotIn("conversion counts", prompt)
+        self.assertNotIn("scanf", prompt)
 
         review_prompt = load_review_prompt()
         self.assertIn("{c_code}", review_prompt)
         self.assertIn("{cases}", review_prompt)
         self.assertIn("{deterministic_report}", review_prompt)
-        self.assertIn("inconclusive", review_prompt)
-        self.assertIn("Review input validity only", review_prompt)
-        self.assertIn("Limited coverage is not a reason", review_prompt)
-        self.assertIn("conversion counts in scanf-family calls", review_prompt)
-        self.assertIn("assess each case independently", review_prompt)
-        self.assertIn("output was empty", review_prompt)
-        self.assertIn("Do not use or assume a problem statement", review_prompt)
+        self.assertIn("complete batch", review_prompt)
+        self.assertIn("Preserve as many existing cases as possible", review_prompt)
+        self.assertIn("Do not require exhaustive coverage", review_prompt)
+        self.assertNotIn("scanf", review_prompt)
+        self.assertNotIn("sentinel", review_prompt)
 
     def test_materializes_c_oracles_and_reuses_the_suite(self):
         generation = {
@@ -50,8 +49,6 @@ class VisibleTestGenerationTests(unittest.TestCase):
         }
         c_runs = [
             {"status": "ACCEPTED", "stdout": "0\n", "stderr": ""},
-            {"status": "ACCEPTED", "stdout": "0\n", "stderr": ""},
-            {"status": "ACCEPTED", "stdout": "8\n", "stderr": ""},
             {"status": "ACCEPTED", "stdout": "8\n", "stderr": ""},
         ]
 
@@ -105,14 +102,10 @@ class VisibleTestGenerationTests(unittest.TestCase):
             review_calls.append(cases)
             return {
                 "assessment": "approved",
-                "diagnosis": "The input is complete.",
-                "verified_case_ids": ["case-001"],
-                "invalid_case_ids": [],
-                "regeneration_guidance": "",
+                "replacements": [],
             }, {"input_tokens": 7, "output_tokens": 3}
 
         c_runs = [
-            {"status": "ACCEPTED", "stdout": "8\n", "stderr": ""},
             {"status": "ACCEPTED", "stdout": "8\n", "stderr": ""},
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -167,7 +160,7 @@ class VisibleTestGenerationTests(unittest.TestCase):
             )
             self.assertEqual(
                 deterministic["data"]["evaluations"][0]["verdict"],
-                "ACCEPTED_STABLE",
+                "ACCEPTED",
             )
             self.assertEqual(generation_calls, [""])
             self.assertEqual(review_calls[0][0]["id"], "case-001")
@@ -184,33 +177,42 @@ class VisibleTestGenerationTests(unittest.TestCase):
                 )
             )
 
-    def test_invalid_suite_is_regenerated_once_then_frozen(self):
+    def test_validator_revision_replaces_requested_case_then_freezes_batch(self):
         generation_feedback = []
+        generations = iter(
+            [
+                {
+                    "strategy": "initial",
+                    "cases": [{"purpose": "case", "input": "1\n"}],
+                },
+                {
+                    "strategy": "replacement",
+                    "cases": [{"purpose": "replacement", "input": "2\n"}],
+                },
+            ]
+        )
         reviews = iter(
             [
                 {
-                    "assessment": "invalid",
-                    "diagnosis": "A required value is missing.",
-                    "verified_case_ids": [],
-                    "invalid_case_ids": ["case-001"],
-                    "regeneration_guidance": "Supply the declared number of values.",
+                    "assessment": "revise",
+                    "replacements": [
+                        {
+                            "case_id": "case-001",
+                            "reason": "The batch needs a distinct behavior.",
+                            "requirements": "Generate a different valid input.",
+                        }
+                    ],
                 },
                 {
                     "assessment": "approved",
-                    "diagnosis": "The replacement input is complete.",
-                    "verified_case_ids": ["case-001"],
-                    "invalid_case_ids": [],
-                    "regeneration_guidance": "",
+                    "replacements": [],
                 },
             ]
         )
 
         def generate(feedback):
             generation_feedback.append(feedback)
-            return {
-                "strategy": "replacement",
-                "cases": [{"purpose": "case", "input": "1\n"}],
-            }, {}
+            return next(generations), {}
 
         def review(_cases, _deterministic_report):
             return next(reviews), {}
@@ -238,10 +240,10 @@ class VisibleTestGenerationTests(unittest.TestCase):
 
             self.assertEqual(suite["status"], "ready")
             self.assertEqual(suite["generation_attempt_count"], 2)
-            self.assertIn("Supply the declared number", generation_feedback[1])
+            self.assertIn("Generate a different valid input", generation_feedback[1])
             self.assertIn("frozen", suite["suite_dir"])
 
-    def test_second_invalid_suite_becomes_unavailable(self):
+    def test_repeated_validator_revision_can_leave_no_usable_cases(self):
         def generate(_feedback):
             return {
                 "strategy": "case",
@@ -250,11 +252,14 @@ class VisibleTestGenerationTests(unittest.TestCase):
 
         def review(_cases, _deterministic_report):
             return {
-                "assessment": "invalid",
-                "diagnosis": "The case is incomplete.",
-                "verified_case_ids": [],
-                "invalid_case_ids": ["case-001"],
-                "regeneration_guidance": "Provide all required values.",
+                "assessment": "revise",
+                "replacements": [
+                    {
+                        "case_id": "case-001",
+                        "reason": "The case is not useful.",
+                        "requirements": "Generate a distinct valid input.",
+                    }
+                ],
             }, {}
 
         accepted_run = {"status": "ACCEPTED", "stdout": "1\n", "stderr": ""}
@@ -279,8 +284,8 @@ class VisibleTestGenerationTests(unittest.TestCase):
                 )
 
             self.assertEqual(suite["status"], "invalid_visible_tests")
-            self.assertEqual(suite["review_status"], "invalid")
-            self.assertEqual(suite["generation_attempt_count"], 2)
+            self.assertEqual(suite["review_status"], "revision_unresolved")
+            self.assertEqual(suite["generation_attempt_count"], 3)
             self.assertEqual(suite["case_count"], 0)
 
     def test_preserves_approved_cases_and_generates_only_replacements(self):
@@ -307,36 +312,18 @@ class VisibleTestGenerationTests(unittest.TestCase):
         reviews = iter(
             [
                 {
-                    "case_reviews": [
-                        {
-                            "case_id": "case-001",
-                            "assessment": "approved",
-                            "diagnosis": "Complete.",
-                            "regeneration_guidance": "",
-                        },
+                    "assessment": "revise",
+                    "replacements": [
                         {
                             "case_id": "case-002",
-                            "assessment": "invalid",
-                            "diagnosis": "Missing a sentinel.",
-                            "regeneration_guidance": "Append the required sentinel.",
+                            "reason": "Substantially redundant.",
+                            "requirements": "Generate a distinct valid behavior.",
                         },
-                        {
-                            "case_id": "case-003",
-                            "assessment": "approved",
-                            "diagnosis": "Complete.",
-                            "regeneration_guidance": "",
-                        },
-                    ]
+                    ],
                 },
                 {
-                    "case_reviews": [
-                        {
-                            "case_id": "case-001",
-                            "assessment": "approved",
-                            "diagnosis": "Complete replacement.",
-                            "regeneration_guidance": "",
-                        }
-                    ]
+                    "assessment": "approved",
+                    "replacements": [],
                 },
             ]
         )
@@ -383,15 +370,18 @@ class VisibleTestGenerationTests(unittest.TestCase):
 
         self.assertEqual(suite["status"], "ready")
         self.assertEqual(suite["case_count"], 3)
-        self.assertEqual(inputs, ["1\n", "3\n", "4\n"])
+        self.assertEqual(inputs, ["1\n", "4\n", "3\n"])
         self.assertNotIn("5\n", inputs)
-        self.assertEqual(json.loads(feedback[1])["replacement_count"], 1)
+        self.assertEqual(
+            [slot["case_id"] for slot in json.loads(feedback[1])["replacement_slots"]],
+            ["case-002"],
+        )
         replacement = next(
-            entry for entry in history if entry["action"] == "replacement_requested"
+            entry for entry in history if entry["action"] == "batch_review"
         )
         self.assertEqual(replacement["data"]["replacement_count"], 1)
 
-    def test_deterministic_rejection_is_reviewed_and_replaced(self):
+    def test_deterministic_rejection_is_replaced_before_batch_review(self):
         generations = iter(
             [
                 {
@@ -409,36 +399,6 @@ class VisibleTestGenerationTests(unittest.TestCase):
                 },
             ]
         )
-        reviews = iter(
-            [
-                {
-                    "case_reviews": [
-                        {
-                            "case_id": "case-001",
-                            "assessment": "approved",
-                            "diagnosis": "Complete.",
-                            "regeneration_guidance": "",
-                        },
-                        {
-                            "case_id": "candidate-002",
-                            "assessment": "invalid",
-                            "diagnosis": "EOF leaves the loop condition true.",
-                            "regeneration_guidance": "Append the zero sentinel.",
-                        },
-                    ]
-                },
-                {
-                    "case_reviews": [
-                        {
-                            "case_id": "case-001",
-                            "assessment": "approved",
-                            "diagnosis": "The sentinel terminates the loop.",
-                            "regeneration_guidance": "",
-                        }
-                    ]
-                },
-            ]
-        )
         review_inputs = []
 
         def generate(_feedback):
@@ -446,11 +406,11 @@ class VisibleTestGenerationTests(unittest.TestCase):
 
         def review(cases, _deterministic_report):
             review_inputs.append(cases)
-            return next(reviews), {}
+            return {"assessment": "approved", "replacements": []}, {}
 
         accepted = {"status": "ACCEPTED", "stdout": "ok\n", "stderr": ""}
         timed_out = {"status": "TIME_LIMIT_EXCEEDED", "stdout": "", "stderr": ""}
-        c_runs = [accepted, accepted, timed_out, timed_out, accepted, accepted]
+        c_runs = [accepted, timed_out, accepted]
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch(
@@ -478,10 +438,15 @@ class VisibleTestGenerationTests(unittest.TestCase):
         self.assertEqual(suite["case_count"], 2)
         self.assertEqual(
             [case["id"] for case in review_inputs[0]],
-            ["case-001", "candidate-002"],
+            ["case-001", "case-002"],
         )
+        self.assertEqual(
+            [case["input"] for case in review_inputs[0]],
+            ["1\n", "2\n0\n"],
+        )
+        self.assertEqual(len(review_inputs), 1)
 
-    def test_inconclusive_review_disables_suite_without_regeneration(self):
+    def test_repeated_batch_revision_disables_suite_when_no_cases_remain(self):
         generation_count = 0
 
         def generate(_feedback):
@@ -489,16 +454,21 @@ class VisibleTestGenerationTests(unittest.TestCase):
             generation_count += 1
             return {
                 "strategy": "case",
-                "cases": [{"purpose": "case", "input": "1\n"}],
+                "cases": [
+                    {"purpose": "case", "input": f"{generation_count}\n"}
+                ],
             }, {}
 
         def review(_cases, _deterministic_report):
             return {
-                "assessment": "inconclusive",
-                "diagnosis": "The source does not establish the valid range.",
-                "verified_case_ids": [],
-                "invalid_case_ids": [],
-                "regeneration_guidance": "",
+                "assessment": "revise",
+                "replacements": [
+                    {
+                        "case_id": "case-001",
+                        "reason": "The batch needs another behavior.",
+                        "requirements": "Generate a distinct valid input.",
+                    }
+                ],
             }, {}
 
         accepted_run = {"status": "ACCEPTED", "stdout": "1\n", "stderr": ""}
@@ -522,9 +492,10 @@ class VisibleTestGenerationTests(unittest.TestCase):
                     review,
                 )
 
-            self.assertEqual(suite["status"], "review_inconclusive")
+            self.assertEqual(suite["status"], "invalid_visible_tests")
+            self.assertEqual(suite["review_status"], "revision_unresolved")
             self.assertEqual(suite["case_count"], 0)
-            self.assertEqual(generation_count, 1)
+            self.assertEqual(generation_count, 2)
 
     def test_review_failure_is_operational_and_retried_on_resume(self):
         review_calls = 0
@@ -542,10 +513,7 @@ class VisibleTestGenerationTests(unittest.TestCase):
                 raise RuntimeError("Provider unavailable.")
             return {
                 "assessment": "approved",
-                "diagnosis": "The input is complete.",
-                "verified_case_ids": ["case-001"],
-                "invalid_case_ids": [],
-                "regeneration_guidance": "",
+                "replacements": [],
             }, {}
 
         accepted_run = {"status": "ACCEPTED", "stdout": "1\n", "stderr": ""}
@@ -611,18 +579,18 @@ class VisibleTestGenerationTests(unittest.TestCase):
             self.assertEqual(retried["status"], "ready")
             self.assertTrue(retried["frozen"])
 
-    def test_unstable_c_output_rejects_the_candidate(self):
-        c_runs = [
-            {"status": "ACCEPTED", "stdout": "1\n", "stderr": ""},
-            {"status": "ACCEPTED", "stdout": "2\n", "stderr": ""},
-        ]
+    def test_executes_each_candidate_once(self):
+        accepted_run = {"status": "ACCEPTED", "stdout": "1\n", "stderr": ""}
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch(
                     "visible_test_preparation.compile_c",
                     return_value=(SimpleNamespace(returncode=0), "c"),
                 ),
-                patch("visible_test_preparation.run_program", side_effect=c_runs),
+                patch(
+                    "visible_test_preparation.run_program",
+                    return_value=accepted_run,
+                ) as run,
             ):
                 suite = materialize_generated_suite(
                     "C",
@@ -632,13 +600,11 @@ class VisibleTestGenerationTests(unittest.TestCase):
                     "generation {c_code}",
                 )
 
-            self.assertEqual(suite["status"], "no_valid_cases")
-            self.assertEqual(
-                suite["rejected_cases"][0]["verdict"],
-                "NONDETERMINISTIC_OUTPUT",
-            )
+            self.assertEqual(suite["status"], "ready")
+            self.assertEqual(suite["case_count"], 1)
+            self.assertEqual(run.call_count, 1)
 
-    def test_empty_stable_output_is_exposed_to_review(self):
+    def test_validator_receives_a_compact_successful_execution_summary(self):
         review_reports = []
 
         def generate(_feedback):
@@ -649,13 +615,7 @@ class VisibleTestGenerationTests(unittest.TestCase):
 
         def review(_cases, deterministic_report):
             review_reports.append(deterministic_report)
-            return {
-                "assessment": "invalid",
-                "diagnosis": "The input does not satisfy all required conversions.",
-                "verified_case_ids": [],
-                "invalid_case_ids": ["case-001"],
-                "regeneration_guidance": "Preserve the required line boundaries.",
-            }, {}
+            return {"assessment": "approved", "replacements": []}, {}
 
         empty_run = {"status": "ACCEPTED", "stdout": "", "stderr": ""}
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -681,12 +641,14 @@ class VisibleTestGenerationTests(unittest.TestCase):
                     review,
                 )
 
-        evaluation = review_reports[0]["evaluations"][0]
-        self.assertTrue(evaluation["stable_output_empty"])
-        self.assertEqual(evaluation["first_output_bytes"], 0)
-        self.assertEqual(evaluation["second_output_bytes"], 0)
+        self.assertEqual(review_reports[0]["case_count"], 1)
+        self.assertEqual(review_reports[0]["executions_per_case"], 1)
+        self.assertEqual(
+            review_reports[0]["status"],
+            "all_cases_accepted",
+        )
 
-    def test_approval_without_explicit_case_verification_is_rejected(self):
+    def test_approval_with_legacy_review_fields_is_rejected(self):
         def generate(_feedback):
             return {
                 "strategy": "Exercise one value.",
@@ -727,7 +689,7 @@ class VisibleTestGenerationTests(unittest.TestCase):
                 )
 
         self.assertEqual(suite["status"], "review_failed")
-        self.assertIn("explicitly verify every case", suite["details"])
+        self.assertIn("must contain replacements", suite["details"])
 
 
 class VisibleTestExecutionTests(unittest.TestCase):

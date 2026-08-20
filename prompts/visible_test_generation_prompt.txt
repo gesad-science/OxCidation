@@ -1,10 +1,10 @@
 You are the Tester Agent for a behavior-preserving C-to-Rust translation pipeline.
 
-Using only the C source code below, generate a language-agnostic suite of concrete standard-input cases. The objective is to validate the observable behavior of the program by exercising its relevant branches, loop boundaries, arithmetic behavior, indexing behavior, input shapes, and meaningful edge cases that can be inferred from the source.
+Using only the C source code below, generate a language-agnostic batch of concrete standard-input cases that can help evaluate the program's observable behavior.
 
-Choose how many cases are necessary to exercise the distinct meaningful behaviors that can be inferred from this program. Do not reduce the number of cases merely to keep the suite short. Avoid redundant cases, and give every case a clear purpose. Each case must contain the complete text that should be sent to standard input.
+Choose the number of cases needed for this program. Cover distinct meaningful behaviors that can be inferred from the source. Avoid redundant cases, give every case a clear purpose, and make each input complete for the execution it is intended to exercise.
 
-Before returning a case, verify that it supplies a value for every input operation reached by that case, including reads controlled by input-dependent loops. Preserve meaningful line boundaries, delimiters, sentinels, and conversion counts exactly as required by input APIs such as scanf, fgets, and getchar. Each case must enter the behavior described by its purpose instead of merely causing the program to terminate cleanly before its main processing logic runs. Do not use or assume a problem statement. Do not write C tests, Rust tests, shell commands, expected outputs, or explanations outside the structured response. Do not invent malformed or incomplete inputs unless the source explicitly handles them. Expected outputs will be produced separately by executing the accepted C program.
+Do not assume a problem statement or constraints that are not present in the source. Return only the structured test batch. Do not generate test code, commands, expected outputs, or malformed inputs. Expected outputs are obtained separately by executing the C reference program.
 
 C source:
 {c_code}

@@ -20,7 +20,6 @@ REUSABLE_PREPARATION_STATUSES = frozenset(
     {
         "ready",
         "invalid_visible_tests",
-        "review_inconclusive",
         "baseline_compile_failed",
     }
 )
@@ -148,9 +147,14 @@ def materialize_generated_suite(
             "source": "generated",
             "source_sha256": source_hash,
             "review_status": "not_reviewed",
+            "review_count": 0,
             "generation_attempt_count": 1,
             "generated_candidate_count": attempt.get("candidate_count", 0),
-            "rejected_candidate_count": len(attempt.get("rejected_cases", [])),
+            "deterministic_rejection_count": len(
+                attempt.get("rejected_cases", [])
+            ),
+            "validator_replacement_count": 0,
+            "unresolved_replacement_count": 0,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "active_attempt": attempt["attempt_path"],

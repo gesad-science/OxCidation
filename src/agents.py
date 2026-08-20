@@ -311,12 +311,12 @@ class TesterAgent:
             "source",
             "source_sha256",
             "review_status",
+            "review_count",
             "generation_attempt_count",
             "candidate_count",
             "generated_candidate_count",
-            "rejected_candidate_count",
-            "invalid_case_count",
-            "inconclusive_case_count",
+            "deterministic_rejection_count",
+            "validator_replacement_count",
             "unresolved_replacement_count",
             "case_count",
             "suite_sha256",
@@ -346,8 +346,6 @@ class TesterAgent:
                 failure_category: FailureCategory
                 if suite_status == "invalid_visible_tests":
                     failure_category = "invalid_tests"
-                elif suite_status == "review_inconclusive":
-                    failure_category = "inconclusive_tests"
                 elif suite_status == "baseline_compile_failed":
                     failure_category = "invalid_baseline"
                 elif suite_status in {

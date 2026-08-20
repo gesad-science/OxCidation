@@ -79,21 +79,18 @@ class GeneratedVisibleTestSuite(BaseModel):
     )
 
 
-class VisibleTestCaseReview(BaseModel):
-    case_id: str = Field(description="Identifier of the reviewed generated case.")
-    assessment: Literal["approved", "invalid", "inconclusive"] = Field(
-        description="Whether this individual input is supported by the C source."
-    )
-    diagnosis: str = Field(description="Concise evidence for this case assessment.")
-    regeneration_guidance: str = Field(
-        description="Replacement guidance for this case; empty when approved."
-    )
+class VisibleTestReplacement(BaseModel):
+    case_id: str = Field(description="Identifier of the case to replace.")
+    reason: str = Field(description="Concise, source-supported reason for replacement.")
+    requirements: str = Field(description="Actionable requirements for the replacement.")
 
 
 class VisibleTestSuiteReview(BaseModel):
-    case_reviews: list[VisibleTestCaseReview] = Field(
-        min_length=1,
-        description="Exactly one review for every supplied case identifier.",
+    assessment: Literal["approved", "revise"] = Field(
+        description="Whether the complete generated input batch is ready or needs revision."
+    )
+    replacements: list[VisibleTestReplacement] = Field(
+        description="Minimal set of existing cases that should be replaced."
     )
 
 
@@ -330,10 +327,10 @@ def generate_visible_test_suite(c_code: str, test_root: str) -> str:
         prompt = generation_prompt.replace("{c_code}", c_code)
         if regeneration_feedback:
             prompt += (
-                "\n\nGenerate replacement cases only for the rejected candidates described "
-                "below. Previously approved cases are preserved; do not repeat or rewrite "
-                "them. Follow the requested replacement count.\n"
-                f"Replacement guidance: {regeneration_feedback}"
+                "\n\nGenerate only the requested replacement cases, one per slot and "
+                "in the listed order. Do not repeat retained cases or reuse rejected "
+                "inputs.\n"
+                f"Replacement request: {regeneration_feedback}"
             )
         return invoke_structured(
             active_llm(),

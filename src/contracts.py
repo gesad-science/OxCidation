@@ -91,11 +91,11 @@ class VisibleTestSuite(TypedDict, total=False):
     review_prompt_tokens: int
     review_completion_tokens: int
     review_status: str
+    review_count: int
     generation_attempt_count: int
     generated_candidate_count: int
-    rejected_candidate_count: int
-    invalid_case_count: int
-    inconclusive_case_count: int
+    deterministic_rejection_count: int
+    validator_replacement_count: int
     unresolved_replacement_count: int
     suite_sha256: str
     preparation_history_path: str

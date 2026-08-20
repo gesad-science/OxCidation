@@ -235,29 +235,6 @@ class TranslationValidationTests(unittest.TestCase):
         self.assertEqual(tested["test_metrics"]["failure_category"], "invalid_tests")
         self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
 
-    def test_inconclusive_prepared_suite_skips_visible_repair(self):
-        session = _TesterSession(
-            {
-                "status": "review_inconclusive",
-                "suite_dir": "visible/sample/hash",
-                "case_count": 0,
-                "details": "The valid range cannot be inferred.",
-            }
-        )
-        state = {
-            "file_name": "sample.c",
-            "c_code": "int main(void) { return 0; }",
-            "rust_code": "fn main() {}",
-            "visible_test_root": "visible/sample",
-            "execution_history": [],
-        }
-
-        tested = asyncio.run(TesterAgent(session).run_suite(state))
-        decision = CodeValidator(max_repairs=5).from_tests({**state, **tested})
-
-        self.assertEqual(tested["test_metrics"]["failure_category"], "inconclusive_tests")
-        self.assertEqual(decision["validation_decision"]["next_action"], "run_judge")
-
     def test_incompatible_c_baseline_is_explicitly_marked_invalid(self):
         session = _TesterSession(
             {

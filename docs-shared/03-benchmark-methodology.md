@@ -112,13 +112,13 @@ OxCidation preserves the process rather than only a final pass/fail label.
 ### Once per C program
 
 - visible-test generation attempts;
-- deterministic candidate rejections and stability checks;
-- Validator review per candidate and one optional replacement round for rejected cases;
+- deterministic candidate execution and rejection counts;
+- whole-batch Validator review and selective replacement of requested slots;
 - frozen suite hash or terminal reason for unavailable visible tests.
 
-Semantic terminal outcomes, such as an inconclusive review, are reusable.
-Operational generation or review failures stop the benchmark before that
-program's prompt runs and remain retriable with `--resume`.
+Approved and bounded partial suites are reusable. Operational generation or
+review failures stop the benchmark before that program's prompt runs and
+remain retriable with `--resume`.
 
 ### Before repair
 

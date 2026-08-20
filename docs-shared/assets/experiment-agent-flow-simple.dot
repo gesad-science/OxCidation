@@ -47,12 +47,12 @@ digraph OxCidationMainExperiment {
 
     { rank=same;
       tester_prepare [
-        label="TESTER\nGenerate candidate inputs\nand run execution checks",
+        label="TESTER\nGenerate inputs and keep\nthose executable on C",
         fillcolor="#DDF3EE",
         color="#267A6E"
       ];
       validator_suite [
-        label="VALIDATOR\nReview each test case\nReplace rejected cases once",
+        label="VALIDATOR\nReview the complete batch\nRequest selected replacements",
         fillcolor="#FFF1CC",
         color="#A46A00"
       ];

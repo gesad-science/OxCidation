@@ -6,10 +6,11 @@ files, hashes, detailed error categories, and operational failure branches.
 
 ![Simplified experiment agent flow](assets/experiment-agent-flow-simple.svg)
 
-The visible-test suite is prepared once before translation. Approved cases are
-frozen and reused. Only a confirmed visible-test translation discrepancy can
-guide a repair. The initial and final Judge results are external observations
-and never enter the repair loop.
+The visible-test suite is prepared once before translation. Executable cases
+are preserved, the complete batch is reviewed, and only requested slots are
+replaced. The frozen suite is then reused. Only a confirmed visible-test
+translation discrepancy can guide a Rust repair. Judge results never enter the
+repair loop.
 
 The [detailed benchmark flow](08-experiment-agent-flow.md) additionally shows
 how each program is combined with every candidate prompt during prompt

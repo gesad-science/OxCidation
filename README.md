@@ -258,11 +258,11 @@ OXCIDATION_CONFIG_FILE=config/openai-benchmark.yaml \
   --seed 42
 ```
 
-The benchmark first asks the configured model to generate concrete standard-input cases from each C source. The model chooses the suite size and never receives the problem statement or Judge cases. Each candidate is executed twice against the accepted C program; duplicate, failing, timed-out, or unstable candidates are rejected deterministically.
+The benchmark first asks the configured model to generate concrete standard-input cases from each C source. The model chooses the suite size and never receives the problem statement or Judge cases. Each candidate is executed against the accepted C program; duplicate, failing, or timed-out candidates are rejected deterministically. Passing cases are preserved, and only failed slots are requested again.
 
-Before any translation prompt runs, the Validator reviews every generated candidate independently, using only the C source and the deterministic execution report. Cases approved by both stages are kept. Rejected cases receive one bounded replacement round, while approved cases are preserved. Replacement cases that remain rejected or inconclusive are discarded. Visible testing is disabled only when no approved case remains; translation and Judge evaluation still continue. The resulting suite is frozen and shared by every translation prompt.
+Once the current batch contains only executable inputs, the Validator reviews it as a whole using the C source and a compact deterministic summary. It either approves the batch or identifies the minimal set of cases to replace, with concise source-supported requirements. Retained cases are not regenerated. Replacements are checked against C before one final batch review. Usable cases are frozen even when a bounded replacement remains unresolved; visible testing is disabled only when no usable case remains. The same frozen suite is shared by every translation prompt.
 
-An LLM invocation or structured-response failure is recorded as an operational preparation failure, not as an inconclusive Validator assessment. The benchmark stops before translating that program, and `--resume` retries preparation so prompts are never evaluated with different suites.
+An LLM invocation or structured-response failure is recorded as an operational preparation failure. The benchmark stops before translating that program, and `--resume` retries preparation so prompts are never evaluated with different suites.
 
 It then performs the following work for every `program x prompt` pair:
 
@@ -303,7 +303,7 @@ The command prints the path to `results.csv` when the benchmark completes. It cr
 
 Each interaction records a sequence number, causal predecessor, agent, action, repair attempt, and action-specific data. Reports, compiler diagnostics, and code versions are stored once; later events refer to their causal predecessor instead of copying the same payload. This makes a failure loop directly traceable, for example: `visible_test_report` -> `semantic_analysis` -> `visible_test_decision` -> `repair` -> `compilation` -> `visible_test_report`. `semantic_analysis_skipped` explicitly identifies transitions where no LLM analysis occurred.
 
-The `visible_suite_*` CSV fields report review status, generation attempts, candidate counts, suite hash, and the source-level preparation-history path. `validator_completed_analysis_count`, `validator_invalid_visible_test_count`, and `validator_inconclusive_count` describe post-translation differential analyses. `agent_interactions_path` links to the per-combination translation and repair history without duplicating suite preparation messages.
+The `visible_suite_*` CSV fields report batch-review status and count, generation attempts, deterministic rejections, Validator-requested replacements, unresolved slots, suite hash, and the shared preparation-history path. `validator_completed_analysis_count`, `validator_invalid_visible_test_count`, and `validator_inconclusive_count` describe post-translation differential analyses. `agent_interactions_path` links to the per-combination translation and repair history without duplicating suite preparation messages.
 
 ### Resume an interrupted benchmark
 

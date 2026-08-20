@@ -11,7 +11,7 @@ the run contained only five C programs and was intended to test the pipeline.
 |---|---|---|
 | `p02203` | Validator repair guidance misunderstood one `scanf` call and damaged two initially accepted translations. | The initial and final Judge results exposed the regression, but the repair loop still repeated it until the repair limit. |
 | `p00639` Judge | The accepted C program was rejected because outputs requiring numeric tolerance were compared textually. | The C baseline was marked invalid, so final Rust evaluation was safely recorded as `SKIPPED`. |
-| `p00639` visible tests | Most generated inputs omitted the terminating sentinel and timed out; the frozen suite contained only the termination case. | Deterministic filtering rejected the timeouts. The old whole-suite regeneration then lost an otherwise useful surviving case. This preparation flow has since been replaced by per-case review and selective replacement. |
+| `p00639` visible tests | Most generated inputs omitted the terminating sentinel and timed out; the frozen suite contained only the termination case. | Deterministic filtering rejected the timeouts. The old whole-suite regeneration then lost an otherwise useful survivor. The current flow preserves passing slots, regenerates failed slots, and reviews the retained batch as a whole. |
 
 ## 1. Incorrect `scanf` Interpretation Caused Regressive Repairs
 
@@ -121,7 +121,7 @@ evidence about its main behavior.
 
 ### How the program handled it in that run
 
-- Every candidate was executed twice against the accepted C program.
+- Every candidate was executed against the accepted C program.
 - Candidates that timed out were excluded.
 - The Validator reviewed only deterministic survivors and approved the final
   sentinel-only suite as valid.
@@ -132,22 +132,21 @@ evidence about its main behavior.
 
 ### Change implemented afterward
 
-Visible-test preparation now works per case:
+Visible-test preparation now separates execution validity from batch quality:
 
-1. The Validator returns an independent `approved`, `invalid`, or
-   `inconclusive` decision for each candidate.
-2. Deterministically rejected candidates, including timeouts, are also shown to
-   the Validator so that replacement guidance can explain the actual defect.
-3. Approved cases are preserved and are not regenerated or reviewed again.
-4. The Tester receives the rejected cases and generates only the required
-   number of replacements, at most once.
-5. Approved cases from both rounds are combined in one frozen suite.
-6. Unresolved replacements are recorded instead of invalidating preserved
-   cases. Visible testing is disabled only when no approved case remains.
+1. Each generated input runs against C before LLM review.
+2. Passing slots are preserved; only failed slots are requested again.
+3. Runtime failure details remain in deterministic artifacts and are not sent
+   to the Tester.
+4. The Validator receives only executable inputs and reviews the batch as a
+   whole for clear source-supported quality problems.
+5. A revision names the minimal cases to replace; retained cases stay intact.
+6. Replacements run against C before a final batch review.
+7. Unresolved slots are reported without discarding other usable cases.
 
-This change prevents one defective input from discarding unrelated valid test
-evidence. It does not guarantee strong coverage: a final suite can still be
-small, and source-only review cannot infer constraints absent from the C code.
+This prevents one defective input from discarding unrelated evidence while
+allowing the Validator to notice a batch that is valid but too repetitive or
+trivial. It still cannot infer constraints absent from the C source.
 
 ## Implications for Future Analysis
 
@@ -155,8 +154,8 @@ small, and source-only review cannot infer constraints absent from the C code.
 - Treat `SKIPPED` as not evaluable, not as translation success or failure.
 - Inspect `SKIPPED` reasons before excluding a problem from the analytical
   population.
-- Report visible-suite approved cases, rejected cases, inconclusive cases, and
-  unresolved replacements separately.
+- Report frozen cases, deterministic rejections, Validator-requested
+  replacements, and unresolved replacements separately.
 - Do not interpret a valid but trivial visible suite as strong behavioral
   evidence.
 - Validate checker requirements, especially numeric tolerances and special

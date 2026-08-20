@@ -58,10 +58,10 @@ experiment.
 - Reproducible source and prompt selection.
 - Translation, compilation, generated visible tests, semantic validation, and
   bounded repair.
-- Deterministic visible-input filtering, per-case Validator review, one bounded
-  replacement round, and frozen suite reuse across prompts.
-- Operational generation or review failures remain separate from semantic
-  inconclusive decisions and are retried on benchmark resume.
+- Deterministic visible-input filtering, whole-batch Validator review,
+  selective slot replacement, and frozen suite reuse across prompts.
+- Operational generation or review failures remain explicit and are retried
+  on benchmark resume.
 - Independent initial and final Judge observations.
 - Resumable exact description-hash mapping from accepted-C CodeNet AIZU
   problems to AOJ IDs.
@@ -72,10 +72,9 @@ experiment.
 
 ### Working, but not methodologically complete
 
-- Visible-case review is model-based and cannot confirm constraints absent
-  from the C source; cases without supported validity are discarded and suites
-  with no approved cases are disabled and
-  reported instead of influencing Rust repair.
+- Visible-batch review is model-based and cannot confirm constraints absent
+  from the C source. It preserves usable cases, requests only supported
+  replacements, and disables visible testing when no usable case remains.
 - Exact AIZU mapping and system-suite prefetch are complete. The remaining
   eligibility step is a population-wide accepted-C baseline validation. The
   earlier numeric-mapping corpus is invalid for research use. AtCoder system

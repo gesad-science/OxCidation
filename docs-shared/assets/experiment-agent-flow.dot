@@ -50,12 +50,21 @@ digraph OxCidationExperiment {
       color="#267A6E"
     ];
     deterministic [
-      label="DETERMINISTIC TEST ENGINE\nCompile C; run each input twice\nReject duplicates, failures, timeouts and unstable output\nvisible_test_preparation.py",
+      label="DETERMINISTIC TEST ENGINE\nCompile C; run each input once\nReject duplicates, failures and timeouts\nvisible_test_preparation.py",
       fillcolor="#E7F3E8",
       color="#3A7D44"
     ];
+    deterministic_decision [
+      shape=diamond,
+      style=filled,
+      label="Executable\nbatch",
+      fillcolor="#EEF7EF",
+      color="#3A7D44",
+      width=1.4,
+      height=0.9
+    ];
     suite_review [
-      label="VALIDATOR AGENT\nReview C + surviving inputs + deterministic report\nNo Rust, problem statement or Judge data",
+      label="VALIDATOR AGENT\nReview the complete executable batch\nC source + compact deterministic summary",
       fillcolor="#FFF1CC",
       color="#A46A00"
     ];
@@ -69,7 +78,7 @@ digraph OxCidationExperiment {
       height=0.9
     ];
     regenerate [
-      label="TESTER AGENT\nGenerate replacements once\nonly for rejected cases",
+      label="TESTER AGENT\nGenerate only requested slots\nKeep the retained batch unchanged",
       fillcolor="#DDF3EE",
       color="#267A6E"
     ];
@@ -79,7 +88,7 @@ digraph OxCidationExperiment {
       color="#267A6E"
     ];
     unavailable [
-      label="VISIBLE TESTS DISABLED\nNo approved cases remain\nTranslation and Judge still continue",
+      label="VISIBLE TESTS DISABLED\nNo usable cases remain\nTranslation and Judge still continue",
       fillcolor="#F2F4F7",
       color="#667085"
     ];
@@ -90,12 +99,14 @@ digraph OxCidationExperiment {
     ];
 
     generate -> deterministic;
-    deterministic -> suite_review;
+    deterministic -> deterministic_decision;
+    deterministic_decision -> suite_review [xlabel="all retained cases executable"];
+    deterministic_decision -> regenerate;
     suite_review -> suite_decision;
     suite_decision -> frozen [xlabel="approved"];
-    suite_decision -> regenerate [xlabel="rejected cases"];
-    regenerate -> deterministic [xlabel="replacement candidates"];
-    suite_decision -> unavailable [xlabel="no approved cases"];
+    suite_decision -> regenerate;
+    regenerate -> deterministic [xlabel="replacement inputs"];
+    deterministic_decision -> unavailable [xlabel="no usable cases"];
     generate -> operational [style=dashed, color="#B42318", xlabel="LLM failure"];
     suite_review -> operational [style=dashed, color="#B42318", xlabel="LLM or parsing failure"];
   }

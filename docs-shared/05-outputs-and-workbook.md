@@ -118,10 +118,11 @@ program and translation prompt.
 | Visible Suite Status | Whether preparation produced a frozen usable suite. `baseline_compile_failed` clearly excludes the visible suite from translation evidence. |
 | Visible Suite Review Status | Pre-translation review result for the shared visible suite. |
 | Visible Suite C Compile Profile | Successful local C compatibility profile. Empty means every configured profile failed. |
-| Visible Suite Generation Attempts | Number of suite generations, at most two. |
-| Visible Suite Invalid Cases | Cases rejected by the Validator after source-only review. This metric is available in `results.csv` and `summary.json`, not in the compact workbook table. |
-| Visible Suite Inconclusive Cases | Generated cases discarded because source-only review could not establish validity. |
-| Visible Suite Unresolved Replacements | Rejected cases for which the single replacement round produced no approved substitute. |
+| Visible Suite Review Count | Number of complete-batch Validator reviews attempted, up to two. |
+| Visible Suite Generation Attempts | Number of initial or replacement generation calls, up to three. |
+| Visible Suite Deterministic Rejections | Generated candidates rejected because they were duplicate, failed, or timed out when executed on C. |
+| Visible Suite Validator Replacements | Cases the Validator requested to replace across batch reviews. |
+| Visible Suite Unresolved Replacements | Requested slots that could not be filled within the bounded preparation flow. |
 | Visible Cases Total | Generated visible cases executed. |
 | Visible Cases Passed | Visible cases passed by final Rust. |
 | Judge Status | Final Rust Judge verdict. |
@@ -224,8 +225,7 @@ Inside `model_outputs/<submission>/<prompt>/`:
 Use `attempts.json` and `agent_interactions.json` when the complete history is
 needed.
 
-The full `results.csv` and `summary.json` also contain visible-suite candidate
-counts: generated, deterministically rejected, Validator-invalid, inconclusive,
-unresolved replacements, and approved. The workbook intentionally keeps only
-the most useful preparation fields in its main table; the complete counts stay
-in the machine-readable reports and suite preparation history.
+The full `results.csv` and `summary.json` contain generated candidate and frozen
+case counts in addition to the preparation fields shown in the workbook.
+Detailed inputs, verdicts, reasons, and replacement requirements remain in the
+shared suite preparation history instead of being repeated for every prompt.

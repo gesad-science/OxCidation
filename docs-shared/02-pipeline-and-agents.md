@@ -12,32 +12,38 @@ once, before translating the program with different prompts.
 ```text
 C source
   -> LLM proposes input cases
-  -> each candidate is executed twice against C
-  -> duplicate, failed, timed-out, or unstable candidates are rejected
-  -> Validator reviews every candidate independently
-  -> approved cases are preserved; rejected cases request replacements once
-  -> all approved cases are frozen and shared by every prompt
+  -> each candidate is executed against C
+  -> passing cases are retained; failed slots request replacements
+  -> Validator reviews the executable batch as a whole
+  -> only cases named by the Validator are replaced
+  -> replacements run on C; the repaired batch is reviewed once more
+  -> usable cases are frozen and shared by every prompt
 ```
 
 The test generator receives only the C source. It does not receive the problem
-description, public examples, or Judge cases. It also does not generate the
-expected answers: those come from running the accepted C program. The suite
-review receives the C source, every candidate input, and the deterministic
-execution summary, but no Rust code, problem description, expected output, or
-Judge data.
+description, public examples, or Judge cases. It also does not generate
+expected answers: those come from executing the accepted C program. Duplicate,
+failed, and timed-out inputs are removed before
+the Validator is called. Their failed slots may be regenerated without sending
+runtime diagnostics to the model.
 
-Invalid cases and deterministic rejections request only the same number of
-replacement candidates, at most once. Previously approved cases are never
-regenerated or reviewed again. Invalid or inconclusive replacement cases are
-discarded; if at least one approved case remains, that partial suite is frozen.
-Visible testing is disabled only when no approved case remains. A terminal
-decision is reused on resume. This reduces malformed inputs, but cannot
-establish constraints that are absent from the C source.
+The Validator receives the C source, the retained inputs, and a compact summary
+confirming that all of them executed successfully. It judges whether
+the batch is useful and coherent, not whether each input passed execution. A
+revision names only the cases to replace and gives concise requirements. The
+Tester sees those requirements and all retained cases, generates only the
+requested slots, and the replacements return through the deterministic gate.
 
-A failed LLM request or malformed structured response is not a semantic
-`inconclusive` decision. It is recorded as `review_failed`, is not reusable, and
-stops the benchmark before any translation prompt runs for that program. A
-later `--resume` invocation retries the preparation step.
+Generation and review are bounded to three generation calls and two batch
+reviews per program. If a requested replacement cannot be resolved but usable
+cases remain, the partial batch is frozen and the missing slots are reported.
+Visible testing is disabled only when no usable case remains. Terminal suites
+are reused on resume. This reduces malformed and weak inputs, but cannot
+establish constraints absent from the C source.
+
+A failed LLM request or malformed structured response is recorded as
+`review_failed`, is not reusable, and stops the benchmark before any translation
+prompt runs for that program. A later `--resume` invocation retries preparation.
 
 ## Processing One Program and Prompt
 
@@ -122,7 +128,9 @@ Produces visible, language-agnostic behavioral evidence.
 | Receives | Produces |
 |---|---|
 | C source | Candidate visible inputs |
-| Candidate inputs | Stored `.in/.out` suite using C as the output oracle |
+| Retained cases and replacement slots | Replacement inputs for those slots |
+| Candidate inputs | Deterministic acceptance or rejection using C |
+| Frozen inputs | Stored `.in/.out` suite using C as the output oracle |
 | C, Rust, and the stored suite | Differential test report |
 
 ### Validator
@@ -132,7 +140,7 @@ Interprets evidence and chooses the next pipeline action.
 | Receives | Produces |
 |---|---|
 | Translation or compilation status | Continue, repair, or stop decision |
-| C source, candidate inputs, and deterministic preparation report | Per-case approval, invalid-case diagnosis, or inconclusive decision |
+| C source, executable input batch, and deterministic summary | Batch approval or a minimal list of cases to replace |
 | Differential visible failure | Semantic diagnosis, test assessment, and optional repair guidance |
 | Judge result | Terminal classification for reporting only |
 

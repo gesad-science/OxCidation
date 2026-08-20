@@ -17,7 +17,7 @@ LangChain prepends schema-derived JSON formatting instructions.
 |---|---|---|---|
 | Default initial translation | Translator | Main pipeline runs without an explicit benchmark prompt | `prompts/direct_translation_prompt.txt` |
 | Visible-test generation | Tester | Once per selected C program, before translation prompts | `prompts/visible_test_generation_prompt.txt` |
-| Visible-test replacement | Tester, using deterministic and Validator feedback | One bounded round after deterministic rejection or Validator invalidation | Appended in `src/server.py` |
+| Visible-test replacement | Tester, using deterministic or Validator requirements | For failed or explicitly replaced slots, within the preparation bound | Appended in `src/server.py` |
 | Visible-suite correctness review | Validator | After deterministic candidate filtering and before translation | `prompts/visible_test_review_prompt.txt` |
 | Translation-discrepancy analysis | Validator | After C passes a visible case and Rust fails it | Built in `src/server.py` |
 | Rust repair | Translator | After compilation failure or a confirmed translation discrepancy | Built in `src/server.py` |
@@ -57,11 +57,11 @@ statement, Rust translation, sample I/O, or Judge cases.
 ```text
 You are the Tester Agent for a behavior-preserving C-to-Rust translation pipeline.
 
-Using only the C source code below, generate a language-agnostic suite of concrete standard-input cases. The objective is to validate the observable behavior of the program by exercising its relevant branches, loop boundaries, arithmetic behavior, indexing behavior, input shapes, and meaningful edge cases that can be inferred from the source.
+Using only the C source code below, generate a language-agnostic batch of concrete standard-input cases that can help evaluate the program's observable behavior.
 
-Choose how many cases are necessary to exercise the distinct meaningful behaviors that can be inferred from this program. Do not reduce the number of cases merely to keep the suite short. Avoid redundant cases, and give every case a clear purpose. Each case must contain the complete text that should be sent to standard input.
+Choose the number of cases needed for this program. Cover distinct meaningful behaviors that can be inferred from the source. Avoid redundant cases, give every case a clear purpose, and make each input complete for the execution it is intended to exercise.
 
-Before returning a case, verify that it supplies a value for every input operation reached by that case, including reads controlled by input-dependent loops. Preserve meaningful line boundaries, delimiters, sentinels, and conversion counts exactly as required by input APIs such as scanf, fgets, and getchar. Each case must enter the behavior described by its purpose instead of merely causing the program to terminate cleanly before its main processing logic runs. Do not use or assume a problem statement. Do not write C tests, Rust tests, shell commands, expected outputs, or explanations outside the structured response. Do not invent malformed or incomplete inputs unless the source explicitly handles them. Expected outputs will be produced separately by executing the accepted C program.
+Do not assume a problem statement or constraints that are not present in the source. Return only the structured test batch. Do not generate test code, commands, expected outputs, or malformed inputs. Expected outputs are obtained separately by executing the C reference program.
 
 C source:
 {c_code}
@@ -78,59 +78,61 @@ cases:
 
 ## 3. Visible-Test Regeneration
 
-If cases are rejected during deterministic validation or Validator review, the
-following text is appended to the generation prompt. Approved cases are
-preserved and the Tester is asked only for the missing replacements.
+If slots fail deterministic validation or the Validator requests replacements,
+the following text is appended. Retained cases, replacement requirements, and
+forbidden prior inputs are provided as structured JSON.
 
 ```text
-Generate replacement cases only for the rejected candidates described below. Previously approved cases are preserved; do not repeat or rewrite them. Follow the requested replacement count.
-Replacement guidance: {regeneration_feedback}
+Generate only the requested replacement cases, one per slot and in the listed order. Do not repeat retained cases or reuse rejected inputs.
+Replacement request: {regeneration_feedback}
 ```
 
-This can happen at most once per C program.
-Cases classified as `inconclusive` are discarded rather than replaced, because
-the source-only evidence cannot support specific repair guidance.
+The JSON request contains `replacement_slots`, `retained_cases`, and
+`forbidden_inputs`. Deterministic failures use generic requirements and do not
+expose runtime diagnostics to the Tester. Validator revisions use only the
+actionable replacement requirements returned for the named cases. The
+orchestrator maps the ordered responses back to the stable slot identifiers.
 
 ## 4. Visible-Suite Correctness Review
 
-The Validator reviews the C source, generated inputs, and deterministic
-execution summary. It does not see Rust, expected outputs, or Judge evidence.
+The Validator reviews the complete executable batch, not each case in
+isolation. It sees the C source, generated inputs, and a compact deterministic
+summary. It does not see Rust, expected outputs, or Judge evidence.
 
 ```text
-You are the Code Validator reviewing a generated visible-test suite for a behavior-preserving C-to-Rust translation pipeline.
+You are the Code Validator in a behavior-preserving C-to-Rust translation pipeline.
 
-Using only the C source code and generated standard-input cases below, assess each case independently. Determine whether it is complete and coherent with the input protocol that can be inferred from the source. Trace the input operations and their success conditions far enough to confirm that each case reaches the processing behavior claimed by its purpose. In particular, account for line boundaries, delimiters, return-value checks, conversion counts in scanf-family calls, input-dependent counts, and sentinel sequences. A process that exits normally without satisfying the reads or guard that enter the intended processing is not a valid test of that behavior.
+Review the complete batch of generated inputs using only the C source code and the deterministic execution summary.
 
-Return exactly one assessment for every supplied case identifier. Classify a case as approved when its input and claimed path are supported by the source, invalid when it is concretely malformed, incomplete, or internally inconsistent, and inconclusive when validity depends on constraints that cannot be inferred from the source. Never reject or downgrade one case because another case is defective.
+Decide whether the batch is a useful and coherent set of inputs for evaluating the program. Recommend replacements only for concrete, source-supported problems that materially reduce the batch's usefulness, such as an invalid input, substantial redundancy, or a clearly missing distinct behavior.
 
-Review input validity only. Do not evaluate whether the suite has enough cases, covers every branch, exposes every possible translation error, or is sufficiently diverse. Limited coverage is not a reason to classify a case or suite as invalid or inconclusive. The deterministic report records whether each supplied case terminated normally, whether its output was stable, and whether that output was empty. Empty output is not automatically invalid, but it requires checking that the case did not merely bypass the intended processing because an input operation or guard failed.
+Preserve as many existing cases as possible. Do not require exhaustive coverage, assume a problem statement, or invent input constraints that cannot be inferred from the source.
 
-The purpose describes behavior or a branch that the case is intended to exercise; it does not claim that every later condition succeeds unless it says so explicitly. Do not use or assume a problem statement. Do not analyze Rust code, expected outputs, translation quality, or Judge results. Return concise findings in the required structured response and do not reveal hidden chain-of-thought.
-
-For each case, provide concise replacement guidance only when its assessment is invalid or inconclusive. Do not combine cases into a suite-level verdict.
+If revision is needed, identify only the cases that should be replaced and provide concise requirements for each replacement. Do not generate replacement inputs.
 
 C source:
 {c_code}
 
-Generated cases:
+Generated input batch:
 {cases}
 
-Deterministic C execution report:
+Deterministic C execution summary:
 {deterministic_report}
 ```
 
 Structured response:
 
 ```text
-case_reviews:
+assessment: approved | revise
+replacements:
   - case_id: string
-    assessment: approved | invalid | inconclusive
-    diagnosis: string
-    regeneration_guidance: string
+    reason: string
+    requirements: string
 ```
 
-An LLM invocation or parsing error is recorded separately as `review_failed`;
-it is not converted into a semantic `inconclusive` assessment.
+An approved batch must have no replacements. A revision must name existing case
+identifiers and provide both a reason and actionable requirements. An LLM or
+parsing failure is recorded separately as `review_failed`.
 
 ## 5. Translation-Discrepancy Analysis
 

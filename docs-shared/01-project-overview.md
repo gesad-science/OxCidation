@@ -36,11 +36,11 @@ evidence used only for final observation.
 ### Visible tests
 
 The model proposes test inputs after reading only the C source. OxCidation runs
-each candidate twice against C, rejects unusable or unstable inputs, and asks
-the Validator to review every candidate before any translation begins. Approved
-cases are preserved; rejected cases may receive one replacement round. The
-resulting suite is frozen and shared by every prompt. Later C/Rust differences
-can be analyzed by the Validator and may lead to repair.
+each candidate against C and preserves inputs that execute successfully. Failed
+slots are regenerated without exposing runtime diagnostics to the model. The
+Validator then reviews the complete retained batch and may request targeted
+replacements. The resulting suite is frozen and shared by every prompt. Later
+C/Rust differences can be analyzed by the Validator and may lead to repair.
 
 ### External Judge
 

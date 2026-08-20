@@ -45,11 +45,11 @@ RESULT_FIELDS = (
     "visible_suite_cases",
     "visible_suite_review_status",
     "visible_suite_c_compile_profile",
+    "visible_suite_review_count",
     "visible_suite_generation_attempts",
     "visible_suite_generated_candidates",
-    "visible_suite_rejected_candidates",
-    "visible_suite_invalid_cases",
-    "visible_suite_inconclusive_cases",
+    "visible_suite_deterministic_rejections",
+    "visible_suite_validator_replacements",
     "visible_suite_unresolved_replacements",
     "visible_suite_sha256",
     "visible_suite_details",
@@ -312,18 +312,18 @@ def build_result_row(
         "visible_suite_c_compile_profile": visible_suite.get(
             "c_compile_profile", ""
         ),
+        "visible_suite_review_count": visible_suite.get("review_count", 0),
         "visible_suite_generation_attempts": visible_suite.get(
             "generation_attempt_count", 0
         ),
         "visible_suite_generated_candidates": visible_suite.get(
             "generated_candidate_count", 0
         ),
-        "visible_suite_rejected_candidates": visible_suite.get(
-            "rejected_candidate_count", 0
+        "visible_suite_deterministic_rejections": visible_suite.get(
+            "deterministic_rejection_count", 0
         ),
-        "visible_suite_invalid_cases": visible_suite.get("invalid_case_count", 0),
-        "visible_suite_inconclusive_cases": visible_suite.get(
-            "inconclusive_case_count", 0
+        "visible_suite_validator_replacements": visible_suite.get(
+            "validator_replacement_count", 0
         ),
         "visible_suite_unresolved_replacements": visible_suite.get(
             "unresolved_replacement_count", 0
@@ -604,20 +604,20 @@ def summarize(rows: list[dict]) -> dict:
                 int(row.get("visible_suite_generation_attempts", 0) or 0) > 1
                 for row in suites
             ),
+            "reviews": sum(
+                int(row.get("visible_suite_review_count", 0) or 0)
+                for row in suites
+            ),
             "generated_candidates": sum(
                 int(row.get("visible_suite_generated_candidates", 0) or 0)
                 for row in suites
             ),
-            "rejected_candidates": sum(
-                int(row.get("visible_suite_rejected_candidates", 0) or 0)
+            "deterministic_rejections": sum(
+                int(row.get("visible_suite_deterministic_rejections", 0) or 0)
                 for row in suites
             ),
-            "invalid_cases": sum(
-                int(row.get("visible_suite_invalid_cases", 0) or 0)
-                for row in suites
-            ),
-            "inconclusive_cases": sum(
-                int(row.get("visible_suite_inconclusive_cases", 0) or 0)
+            "validator_replacements": sum(
+                int(row.get("visible_suite_validator_replacements", 0) or 0)
                 for row in suites
             ),
             "unresolved_replacements": sum(

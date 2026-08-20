@@ -180,10 +180,11 @@ class BenchmarkCsvTests(unittest.TestCase):
                     "case_count": 2,
                     "review_status": "approved",
                     "c_compile_profile": "gnu89-compat",
+                    "review_count": 2,
                     "generation_attempt_count": 2,
                     "generated_candidate_count": 5,
-                    "rejected_candidate_count": 1,
-                    "invalid_case_count": 1,
+                    "deterministic_rejection_count": 1,
+                    "validator_replacement_count": 1,
                     "suite_sha256": "suite-hash",
                     "details": "",
                     "preparation_history_path": str(
@@ -238,9 +239,10 @@ class BenchmarkCsvTests(unittest.TestCase):
                 "gnu89-compat",
             )
             self.assertEqual(row["visible_suite_generation_attempts"], 2)
+            self.assertEqual(row["visible_suite_review_count"], 2)
             self.assertEqual(row["visible_suite_generated_candidates"], 5)
-            self.assertEqual(row["visible_suite_rejected_candidates"], 1)
-            self.assertEqual(row["visible_suite_invalid_cases"], 1)
+            self.assertEqual(row["visible_suite_deterministic_rejections"], 1)
+            self.assertEqual(row["visible_suite_validator_replacements"], 1)
             self.assertEqual(row["visible_suite_sha256"], "suite-hash")
             self.assertEqual(row["visible_suite_details"], "")
             self.assertEqual(
@@ -256,8 +258,10 @@ class BenchmarkCsvTests(unittest.TestCase):
             suite_summary = summarize([row])["visible_suite_population"]
             self.assertEqual(suite_summary["programs"], 1)
             self.assertEqual(suite_summary["regenerated"], 1)
+            self.assertEqual(suite_summary["reviews"], 2)
             self.assertEqual(suite_summary["generated_candidates"], 5)
-            self.assertEqual(suite_summary["invalid_cases"], 1)
+            self.assertEqual(suite_summary["deterministic_rejections"], 1)
+            self.assertEqual(suite_summary["validator_replacements"], 1)
             self.assertEqual(suite_summary["approved_cases"], 2)
 
             source.path.write_text("int main() {}", encoding="utf-8")

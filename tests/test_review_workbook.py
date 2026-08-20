@@ -86,7 +86,7 @@ class ReviewWorkbookTests(unittest.TestCase):
                 "Prompt ID",
                 [cell.value for cell in workbook["Review Queue"][1]],
             )
-            self.assertEqual(workbook["Automatic Results"].max_column, 24)
+            self.assertEqual(workbook["Automatic Results"].max_column, 26)
             self.assertEqual(workbook["Attempts"].max_column, 19)
             queue_headers = [
                 cell.value for cell in workbook["Review Queue"][1]
